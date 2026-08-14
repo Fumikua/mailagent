@@ -1,0 +1,17 @@
+# Sender domain rules — match by sender email domain (case-insensitive, exact).
+# Schema:
+#   - domain: str           # required — sender email domain
+#     label: str            # required — classification label (must exist in taxonomy)
+#     confidence: float     # optional — default 0.95
+#     local_part_pattern: str  # optional — regex matched against the local part
+#
+# Replace these example domains with your own. Multi-intent sender domains should
+# keep a low confidence so subject/body rules or the LLM can refine the label.
+
+- domain: noreply.github.com
+  label: notification
+  confidence: 0.85
+
+- domain: mailer-daemon.example.com
+  label: noise
+  confidence: 0.90

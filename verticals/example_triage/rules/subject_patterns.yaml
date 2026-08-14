@@ -1,0 +1,27 @@
+# Subject pattern rules — regex matched against the normalized clean subject
+# (reply prefixes stripped, whitespace folded). Patterns use re.IGNORECASE.
+# Schema:
+#   - pattern: str       # required — regex (case-insensitive)
+#     label: str         # required — classification label
+#     confidence: float  # optional — default 0.85
+# Conflict resolution at equal confidence: structural > sender_domains > subject_patterns > body_keywords
+
+- pattern: "Delivery Status Notification"
+  label: noise
+  confidence: 0.89
+
+- pattern: "Automatic reply:"
+  label: noise
+  confidence: 0.89
+
+- pattern: "Out of Office"
+  label: noise
+  confidence: 0.89
+
+- pattern: "\\bURGENT\\b"
+  label: action_required
+  confidence: 0.85
+
+- pattern: "\\bFYI\\b|For Your Information"
+  label: notification
+  confidence: 0.85

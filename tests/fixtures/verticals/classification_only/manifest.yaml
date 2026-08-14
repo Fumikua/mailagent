@@ -1,0 +1,6 @@
+id: classification-only
+namespace: classification_only
+data_schema_version: "1"
+taxonomy: taxonomy.yaml
+data_schema: data-schema.json
+enrichers: []

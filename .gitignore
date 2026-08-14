@@ -1,0 +1,23 @@
+.venv/
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.workspace/
+.worktrees/
+.superpowers/
+.coverage
+data/
+config.yml
+.env
+.env.*
+!.env.example
+
+# LLM 联调测试报告（每次运行自动生成，不入库）
+tests/example_emails/_classification_results*.md
+
+# 真实邮件样本（含敏感商业信息，不入库）
+*.eml
+
+# Bootstrap/RuleLearner 报告（含邮件正文预览，不入库）
+reports/

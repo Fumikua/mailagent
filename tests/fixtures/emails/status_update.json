@@ -1,0 +1,7 @@
+{
+  "message_id": "example-status-001",
+  "sender": "updates@example.com",
+  "subject": "Service status update",
+  "body": "The scheduled maintenance window has moved to 08:00 UTC.",
+  "recipients": ["team@example.com"]
+}

@@ -1,0 +1,16 @@
+# Structural rules — safe condition expressions evaluated against mail variables.
+# No eval(); conditions are parsed safely.
+# Available variables:
+#   has_attachments  (bool) — from ClassificationRequest.context
+#   body_length      (int)  — len(mail.body)
+#   has_recipients   (bool) — len(mail.recipients) > 0
+# Supported operators: > < >= <= == !=  and  boolean AND / OR combinations.
+# Schema:
+#   - condition: str    # required
+#     label: str        # required — classification label
+#     confidence: float # optional — default 0.90
+
+# Example: empty-body auto-replies are noise.
+- condition: "body_length < 50"
+  label: noise
+  confidence: 0.70

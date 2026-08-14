@@ -1,0 +1,28 @@
+# Example taxonomy — flat single-level structure used for audit statistics.
+# Hot-reloaded within ~5s of mtime change. Replace these labels with your own.
+# `exclusive: true` means the label cannot co-occur with other labels.
+
+nodes:
+  - code: action_required
+    label: Action required
+    description: Mail that needs a human response or follow-up (requests, approvals, questions)
+    keywords: [please, request, approve, confirm, urgent, action required, need your, kindly]
+    selection_guidance:
+      - Use as the primary intent when the mail asks the recipient to do something
+      - A forwarded request keeps the action_required intent, not notification
+
+  - code: notification
+    label: Notification
+    description: Broadcasts, status updates, and FYI messages that need no response
+    keywords: [fyi, update, notice, announcement, status, for your information, heads up]
+    selection_guidance:
+      - One-to-many broadcasts and status updates are notifications
+      - If a response is explicitly requested, use action_required instead
+
+  - code: noise
+    label: Noise
+    description: Bounces, auto-replies, alerts, and spam that should not be processed
+    keywords: [alert, spam, junk, delivery status, automatic reply, out of office, mailer-daemon, postmaster]
+    selection_guidance:
+      - Bounces, auto-replies, and delivery status notifications are always noise
+    exclusive: true

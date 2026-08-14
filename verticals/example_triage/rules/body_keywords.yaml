@@ -1,0 +1,19 @@
+# Body keyword rules — substring match against the upper-cased body.
+# match_all: false (default) = any keyword matches (OR); true = all must match (AND).
+# Schema:
+#   - keywords: list[str]   # required
+#     label: str            # required — classification label
+#     confidence: float     # optional — default 0.80
+#     match_all: bool       # optional — default false
+
+- keywords: ["please approve", "please confirm", "action required"]
+  label: action_required
+  confidence: 0.80
+
+- keywords: ["mailer-daemon", "delivery failed", "undeliverable"]
+  label: noise
+  confidence: 0.85
+
+- keywords: ["this is an automated message", "do not reply"]
+  label: noise
+  confidence: 0.80

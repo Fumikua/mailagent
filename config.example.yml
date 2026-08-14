@@ -1,0 +1,249 @@
+app:
+  name: mailagent
+  environment: development
+  log_level: INFO
+
+database:
+  # Use PostgreSQL in Docker; local development uses this SQLite URL by default.
+  url: sqlite+aiosqlite:///./data/mailagent.db
+
+redis:
+  url: redis://localhost:6379/0
+
+model:
+  # OpenAI-compatible endpoint. Supports DeepSeek/Qwen/OpenAI/Ollama.
+  base_url: https://api.openai.com/v1
+  model_name: gpt-4.1-mini
+  api_key_env: OPENAI_API_KEY
+  enabled: false
+
+classification:
+  # Path to taxonomy.yaml file (resolved from the selected vertical's manifest
+  # at runtime; this legacy field is kept for standalone tooling only).
+  taxonomy_path: ./taxonomy.yaml
+  # Autonomy level: L0 (manual review), L1 (assisted), L3 (auto-dispatch).
+  # Manual switch only — no auto upgrade/downgrade (requires ground-truth labels).
+  autonomy_level_default: L0
+  # Confidence threshold for L1/L3 auto-processing.
+  confidence_threshold: 0.8
+  # P0 trust boundary: keep false so every classification is reviewed.
+  auto_accept_enabled: false
+
+# Administrative classification correction API. Fail-closed by default.
+# Enable only behind a trusted reverse proxy that strips any inbound identity
+# header and injects the authenticated reviewer's opaque identifier.
+classification_feedback:
+  mode: disabled  # disabled | trusted_internal
+  reviewer_identity_header: X-MailAgent-Reviewer-Id
+
+vertical:
+  # Select exactly one installed vertical plugin by ID. verticals_path contains
+  # its editable business profile (taxonomy, rules, signals and schemas), not code.
+  # The example-triage vertical ships with core; install additional verticals as
+  # separate pip packages and reference their id here.
+  id: example-triage
+  verticals_path: ./verticals
+
+# Vertical-owned config sections. Core passes these through verbatim; each
+# installed vertical plugin reads only its own section with its own typed model.
+# example-triage needs none. Shown below is the shape a vertical with extra
+# runtime knobs (e.g. a vertical that loads a registry) would use:
+# vertical_overrides:
+#   registry:
+#     data_path: ./data/registry.json
+#     sync_on_startup: true
+vertical_overrides: {}
+
+policy:
+  approval_actions: [send_email, forward_email, delete_email]
+  blocked_actions: [send_email, forward_email, delete_email]
+
+# ---------------------------------------------------------------------------
+# vector-similarity-path-b settings (three-path fusion + bootstrap pipeline)
+# ---------------------------------------------------------------------------
+
+embedding:
+  # Embedding provider: "tei" (local HuggingFace TEI) or "openai" (OpenAI-compatible API).
+  # - tei:    POST /embed with {"inputs": [...]} (no auth). Default for local dev.
+  # - openai: POST /v1/embeddings with {"input": [...], "model": "..."} + Bearer key.
+  #           Works with SiliconFlow, Azure OpenAI, vLLM OpenAI server, etc.
+  provider: tei
+  model_name: Qwen3-Embedding-8B
+  api_base: http://localhost:8080
+  dimension: 4096
+  timeout: 30
+  # OpenAI provider only: name of the env var holding the API key.
+  # Set in .env (e.g. EMBEDDING_API_KEY=sk-xxx). Ignored when provider=tei.
+  # api_key_env: EMBEDDING_API_KEY
+
+# Example: OpenAI-compatible provider (SiliconFlow, etc.)
+# embedding:
+#   provider: openai
+#   model_name: Qwen3-Embedding-8B
+#   api_base: https://api.siliconflow.cn
+#   dimension: 4096
+#   timeout: 30
+#   api_key_env: EMBEDDING_API_KEY
+
+vector_store:
+  # kNN search parameters
+  top_k: 5
+  similarity_threshold: 0.85
+  # A vector answer needs enough accepted examples and separation from
+  # competing categories; otherwise Fusion falls back to the LLM path.
+  minimum_support: 1
+  minimum_margin: 0.03
+  # Sample retention
+  archive_window_months: 12
+  # Stratified sampling threshold for clustering (>this triggers sampling)
+  stratified_sample_threshold: 50000
+
+fusion:
+  # Three-path fusion feature flag (default off for backward compat)
+  enabled: false
+  # Confidence thresholds for each path
+  rule_confidence_threshold: 0.9
+  vector_confidence_threshold: 0.85
+  llm_fallback_threshold: 0.7
+  # Clustering schedule
+  enable_clustering: true
+  cluster_min_size: 5
+  cluster_interval_days: 7
+
+rules:
+  # Rule YAML files directory. The runtime resolves this from the selected
+  # vertical's manifest; this field is a standalone-CLI fallback only.
+  rules_dir: ./verticals/example_triage/rules
+  # Auto-learning
+  enable_autolearn: true
+  autolearn_min_samples: 5
+  autolearn_min_ratio: 0.8
+
+clustering:
+  # HDBSCAN parameters
+  min_cluster_size: 5
+  min_samples: 3
+  metric: cosine
+  # Input size limit (triggers stratified sampling if exceeded)
+  max_samples: 50000
+  # Time window for clustering (days)
+  window_days: 30
+
+bootstrap:
+  # Stage 2 weekly batch size (emails per week)
+  weekly_batch_size: 4200
+  # Default batch size for import command
+  default_batch_size: 50
+  # Report output directory
+  reports_dir: ./reports
+
+# ---------------------------------------------------------------------------
+# Data retention policy (cleanup_job, daily 03:30)
+#
+# Purges expired rows to control table growth and limit PII exposure.
+# Set any field to 0 to skip cleanup for that table.
+# ---------------------------------------------------------------------------
+retention:
+  runs_retention_days: 90           # processing_runs (含完整邮件正文 payload)
+  archive_retention_days: 365       # samples_archive (已归档样本)
+  feedback_retention_days: 365      # classification_feedback (人工修正审计)
+  ledger_retention_days: 90         # mail_gateway_ingest_ledger (仅清理终态行)
+  backfill_audit_retention_days: 365 # mail_gateway_backfill_audit
+
+# ---------------------------------------------------------------------------
+# Inbound IMAP mail gateway (optional)
+#
+# Polls one TLS IMAP mailbox on a cron schedule and creates normal PENDING
+# classification runs for each new message. Disabled by default — enable only
+# after reviewing credentials and the first-sync policy below.
+#
+# Safety defaults:
+#   - initial_sync_mode: from_now  → never imports the existing mailbox backlog;
+#     it records the current highest UID and starts from the next poll.
+#   - bounded_backfill requires explicit initial_backfill_confirmed: true and
+#     is capped at 7 days / 1000 messages. Larger imports must call
+#     run_confirmed_backfill(...) interactively (never scheduled).
+#   - BODY.PEEK[] is used so mail is never marked as read.
+#
+# Credentials: NEVER store the IMAP password in YAML. Set password_env to the
+# NAME of an environment variable (e.g. MAILAGENT_IMAP_PASSWORD) and export
+# that variable in your shell or .env.
+# ---------------------------------------------------------------------------
+# Legacy single-gateway form. It is normalized to one `mail_gateways` entry
+# and remains accepted for one compatibility release. For multiple mailboxes,
+# use `mail_gateways:` with a YAML list as shown in README.md.
+mail_gateway:
+  enabled: false
+
+  # --- Connection (TLS only) ---
+  adapter: imap
+  mailbox_id: primary          # logical id used in cursor + ledger + Redis lock
+  host: imap.example.com
+  port: 993
+  username: ops@example.com
+  password_env: MAILAGENT_IMAP_PASSWORD   # name of env var holding the password
+  use_ssl: true                # must be true; non-TLS is rejected
+  mailbox: INBOX               # IMAP folder to poll
+
+  # --- Polling schedule ---
+  poll_interval_seconds: 60    # must be ≥60 and a multiple of 60
+  fetch_batch_size: 50         # 1–100 messages per poll
+  seen_filter: all             # "all" or "unseen"
+
+  # --- Message size guard ---
+  max_message_bytes: 26214400  # 25 MiB; larger messages are skipped_oversize
+
+  # --- First-sync policy ---
+  # from_now:         record current highest UID, import nothing historical.
+  # bounded_backfill: import up to backfill_since_days / backfill_max_messages
+  #                   (requires initial_backfill_confirmed: true).
+  # incremental:      POP3-only — RETR top N messages as baseline, skip the rest.
+  initial_sync_mode: from_now
+  backfill_since_days: 1               # 1–7, only for bounded_backfill
+  backfill_max_messages: 1000          # 1–1000, only for bounded_backfill
+  initial_backfill_confirmed: false    # set true to authorize bounded_backfill
+  initial_sync_max_messages: 1000     # POP3 incremental baseline cap (≥1)
+
+  # --- Eligibility filters (empty list = allow all) ---
+  # A message must match ALL non-empty filters to be ingested.
+  sender_domain_allowlist: []          # e.g. [partner.example.com]
+  recipient_domain_allowlist: []       # e.g. [ops.example.com]
+  subject_patterns: []                # substring match, e.g. [status, report]
+
+# ---------------------------------------------------------------------------
+# POP3 mail gateway (alternative to IMAP for public mailboxes)
+#
+# POP3 has no UIDVALIDITY, no server-side search, and only INBOX.  The gateway
+# uses incremental first-sync: RETR the top initial_sync_max_messages messages
+# to build a dedup baseline (status=skipped_initial, no runs created), then
+# only processes new messages on subsequent polls.
+#
+# Limitations (PoC scope):
+#   - No delete_after_fetch (messages stay on server; clean mailbox manually).
+#   - No bounded_backfill (POP3 has no server-side date filter).
+#   - RETR marks messages as read at the session level — use a dedicated test
+#     mailbox to avoid interfering with other POP3 clients.
+#
+# To enable: copy the block below, fill in host/username/password_env, set
+# enabled: true.  All fields can also be set via MAILAGENT_MAIL_GATEWAY__*
+# environment variables.
+# ---------------------------------------------------------------------------
+# mail_gateway:
+#   enabled: false
+#   adapter: pop3
+#   mailbox_id: primary
+#   host: pop.example.com
+#   port: 995                          # auto-defaults to 995 for pop3
+#   username: ops@example.com
+#   password_env: MAILAGENT_POP3_PASSWORD
+#   use_ssl: true
+#   mailbox: INBOX                      # ignored for pop3 (only INBOX)
+#   poll_interval_seconds: 60
+#   fetch_batch_size: 50
+#   seen_filter: all                   # ignored for pop3
+#   max_message_bytes: 26214400
+#   initial_sync_mode: incremental     # required for pop3
+#   initial_sync_max_messages: 1000   # baseline cap; older messages are skipped
+#   sender_domain_allowlist: []
+#   recipient_domain_allowlist: []
+#   subject_patterns: []

@@ -1,0 +1,17 @@
+# Example vertical — a minimal, business-neutral email triage template.
+# Fork this directory to bootstrap a new vertical. The executable plugin lives
+# in src/mailagent/verticals/example_triage/ and ships with core; your own
+# vertical should become a separate pip package (see pyproject.toml entry point).
+id: example-triage
+namespace: example_triage
+data_schema_version: "1"
+taxonomy: taxonomy.yaml
+data_schema: data-schema.json
+rules:
+  path: rules
+  version: "1"
+# No enrichers, signals, rag, or preprocessing assets declared — this vertical
+# demonstrates the rule -> llm classification path only. Add asset declarations
+# (rag, target_profiles, signals, preprocessing, retrieval_cleaning) as your
+# vertical grows; undeclared assets are skipped gracefully by the runtime.
+enrichers: []
