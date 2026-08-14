@@ -1,0 +1,8 @@
+- keywords: ["please confirm", "please help", "response requested"]
+  label: request
+  confidence: 0.80
+
+- keywords: ["this is an automated message", "do not reply"]
+  label: automated
+  confidence: 0.85
+

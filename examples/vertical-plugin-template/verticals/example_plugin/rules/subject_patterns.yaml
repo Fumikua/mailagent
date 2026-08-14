@@ -1,0 +1,12 @@
+- pattern: "\\bplease (help|confirm)\\b"
+  label: request
+  confidence: 0.85
+
+- pattern: "\\b(FYI|status update)\\b"
+  label: update
+  confidence: 0.85
+
+- pattern: "automatic reply|delivery status notification"
+  label: automated
+  confidence: 0.90
+

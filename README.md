@@ -100,10 +100,17 @@ mailagent/
 ├── migrations/           # Alembic migrations
 ├── verticals/
 │   └── example_triage/   # Sample vertical: manifest, taxonomy, rules, data-schema
+├── examples/
+│   └── vertical-plugin-template/ # Copyable, independently buildable plugin example
 ├── config.example.yml
 ├── compose.yaml
 └── pyproject.toml
 ```
+
+To create a separately installable vertical, copy
+[`examples/vertical-plugin-template`](examples/vertical-plugin-template). It
+demonstrates the Python entry point, external profile layout, tests, and an
+independent wheel without adding the example package to the Core wheel.
 
 ## Quick Start
 

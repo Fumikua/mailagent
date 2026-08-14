@@ -1,0 +1,4 @@
+- domain: notifications.example.com
+  label: update
+  confidence: 0.80
+

@@ -1,0 +1,10 @@
+id: example-plugin
+namespace: example_plugin
+data_schema_version: "1"
+taxonomy: taxonomy.yaml
+data_schema: data-schema.json
+rules:
+  path: rules
+  version: "1"
+enrichers: []
+

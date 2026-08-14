@@ -1,0 +1,17 @@
+nodes:
+  - code: request
+    label: Request
+    description: A message asking the recipient to respond or take an action.
+    keywords: [please, request, help, confirm]
+
+  - code: update
+    label: Update
+    description: An informational message that does not request a response.
+    keywords: [update, notice, status, fyi]
+
+  - code: automated
+    label: Automated
+    description: An automated message that normally needs no processing.
+    keywords: [automatic reply, delivery failed, do not reply]
+    exclusive: true
+

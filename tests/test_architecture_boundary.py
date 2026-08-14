@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 import base64
 from pathlib import Path
+import tomllib
 
 from mailagent.domain.models import Decision, SampleRecord
 
@@ -92,3 +93,18 @@ def test_public_runtime_contains_no_private_vertical_vocabulary() -> None:
             if any(needle in text for needle in needles):
                 violations.append(str(path.relative_to(PROJECT_ROOT)))
     assert violations == []
+
+
+def test_core_wheel_excludes_plugin_examples() -> None:
+    project = tomllib.loads(
+        (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+
+    assert project["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == [
+        "src/mailagent"
+    ]
+    workspace_members = (
+        project.get("tool", {}).get("uv", {}).get("workspace", {}).get("members", [])
+    )
+    assert "examples/vertical-plugin-template" not in workspace_members
+    assert (PROJECT_ROOT / "examples" / "vertical-plugin-template").is_dir()
