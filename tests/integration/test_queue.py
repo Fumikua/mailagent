@@ -2,6 +2,7 @@
 
 验证入队 / 出队 / classify_job 执行 / 失败更新 status / 资源清理。
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -13,6 +14,7 @@ import pytest
 from mailagent.domain import (
     ClassificationMeta,
     ClassificationResponse,
+    CreateRunRequest,
     MailEvent,
     RunStatus,
 )
@@ -123,8 +125,79 @@ class TestEnqueueClassify:
         job_id = await enqueue_classify(mock_redis, str(uuid4()))
         assert job_id == ""
 
+    async def test_enqueue_uses_deterministic_job_id_when_supplied(self) -> None:
+        mock_redis = MagicMock()
+        mock_job = MagicMock(job_id="outbox:123")
+        mock_redis.enqueue_job = AsyncMock(return_value=mock_job)
+
+        job_id = await enqueue_classify(mock_redis, "run-123", job_id="outbox:123")
+
+        mock_redis.enqueue_job.assert_awaited_once_with(
+            CLASSIFY_JOB_NAME,
+            "run-123",
+            _job_id="outbox:123",
+        )
+        assert job_id == "outbox:123"
+
+
+class TestDurableOutbox:
+    async def test_create_run_keeps_pending_outbox_when_redis_fails(
+        self,
+        store: SqlStore,
+        sample_mail: MailEvent,
+    ) -> None:
+        redis = MagicMock()
+        redis.enqueue_job = AsyncMock(side_effect=ConnectionError("redis unavailable"))
+        service = MailProcessingService(store, MagicMock(), enqueue_fn=enqueue_classify)
+        await service.set_redis_pool(redis)
+
+        run = await service.create_run(CreateRunRequest(email=sample_mail))
+
+        saved = await store.get_run(run.id)
+        pending = await store.list_pending_outbox()
+        assert saved is not None
+        assert saved.status == RunStatus.PENDING
+        assert len(pending) == 1
+        assert pending[0].payload == {"run_id": str(run.id)}
+        assert pending[0].attempts == 1
+
 
 class TestClassifyJob:
+    async def test_duplicate_delivery_is_ignored(
+        self,
+        store: SqlStore,
+        sample_mail: MailEvent,
+        sample_classification: ClassificationResponse,
+    ) -> None:
+        from mailagent.domain import RunResponse
+
+        run_id = uuid4()
+        now = datetime.now(timezone.utc)
+        await store.save_run(
+            RunResponse(
+                id=run_id,
+                status=RunStatus.PENDING,
+                email=sample_mail,
+                skill_version_id=None,
+                decision=None,
+                actions=[],
+                trace=["test:created"],
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        agent = MagicMock()
+        agent.classify = AsyncMock(return_value=sample_classification)
+        service = MailProcessingService(store, MagicMock())
+        context = {"store": store, "classify_agent": agent, "service": service}
+
+        first = await classify_job(context, str(run_id))
+        duplicate = await classify_job(context, str(run_id))
+
+        assert first["status"] == "completed"
+        assert duplicate["status"] == "ignored"
+        agent.classify.assert_awaited_once()
+
     async def test_classify_job_prefers_mail_understanding_pipeline(
         self,
         store: SqlStore,
@@ -153,7 +226,11 @@ class TestClassifyJob:
         service = MailProcessingService(store, MagicMock())
 
         result = await classify_job(
-            {"store": store, "mail_understanding_pipeline": pipeline, "service": service},
+            {
+                "store": store,
+                "mail_understanding_pipeline": pipeline,
+                "service": service,
+            },
             str(run_id),
         )
 
@@ -229,7 +306,9 @@ class TestClassifyJob:
         )
         await store.save_run(run)
         fallback = sample_classification.model_copy(
-            update={"meta": sample_classification.meta.model_copy(update={"fallback": True})}
+            update={
+                "meta": sample_classification.meta.model_copy(update={"fallback": True})
+            }
         )
         mock_classify_agent = MagicMock()
         mock_classify_agent.classify = AsyncMock(return_value=fallback)
@@ -246,6 +325,7 @@ class TestClassifyJob:
         assert saved.status == RunStatus.WAITING_APPROVAL
         assert saved.classification is not None
         assert saved.classification.meta.needs_human_review is True
+
     async def test_classify_job_success(
         self,
         store: SqlStore,
@@ -344,7 +424,9 @@ class TestClassifyJob:
         await store.save_run(run)
 
         mock_classify_agent = MagicMock()
-        mock_classify_agent.classify = AsyncMock(side_effect=RuntimeError("LLM timeout"))
+        mock_classify_agent.classify = AsyncMock(
+            side_effect=RuntimeError("LLM timeout")
+        )
         service = MailProcessingService(store, MagicMock())
 
         ctx = {

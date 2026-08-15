@@ -19,7 +19,9 @@ PROJECT_ROOT = Path(__file__).parents[3]
 
 
 def test_builtin_example_triage_plugin_matches_external_profile() -> None:
-    from mailagent.verticals.example_triage.plugin import plugin as example_triage_plugin
+    from mailagent.verticals.example_triage.plugin import (
+        plugin as example_triage_plugin,
+    )
 
     settings = SimpleNamespace(
         id="example-triage",
@@ -32,9 +34,10 @@ def test_builtin_example_triage_plugin_matches_external_profile() -> None:
     )
 
     assert selected.plugin is example_triage_plugin
-    assert selected.assets.taxonomy_path == (
-        PROJECT_ROOT / "verticals/example_triage/taxonomy.yaml"
-    ).resolve()
+    assert (
+        selected.assets.taxonomy_path
+        == (PROJECT_ROOT / "verticals/example_triage/taxonomy.yaml").resolve()
+    )
     assert selected.assets.rules is not None
 
 
@@ -83,7 +86,9 @@ enrichers: []
         [VerticalPlugin("example", "example", build_empty_runtime)]
     )
 
-    with pytest.raises(VerticalConfigurationError, match="does not match profile namespace"):
+    with pytest.raises(
+        VerticalConfigurationError, match="does not match profile namespace"
+    ):
         load_selected_vertical(
             SimpleNamespace(id="example", verticals_path=str(tmp_path)),
             registry=registry,
@@ -100,7 +105,9 @@ def test_duplicate_plugin_ids_fail_fast() -> None:
 
 
 def test_third_party_entry_point_is_discovered(monkeypatch: pytest.MonkeyPatch) -> None:
-    third_party = VerticalPlugin("customer-service", "customer_service", build_empty_runtime)
+    third_party = VerticalPlugin(
+        "customer-service", "customer_service", build_empty_runtime
+    )
 
     class EntryPoints:
         def select(self, *, group: str):
@@ -110,3 +117,38 @@ def test_third_party_entry_point_is_discovered(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(plugin_module.metadata, "entry_points", lambda: EntryPoints())
 
     assert VerticalPluginRegistry.discover().resolve("customer-service") == third_party
+
+
+def test_discovery_only_loads_selected_third_party_plugin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = VerticalPlugin(
+        "customer-service", "customer_service", build_empty_runtime
+    )
+    def unrelated_load():
+        raise RuntimeError("must not load")
+
+    class EntryPoints:
+        def select(self, *, group: str):
+            assert group == "mailagent.verticals"
+            return [
+                SimpleNamespace(name="unrelated", load=unrelated_load),
+                SimpleNamespace(name="customer-service", load=lambda: selected),
+            ]
+
+    monkeypatch.setattr(plugin_module.metadata, "entry_points", lambda: EntryPoints())
+
+    assert (
+        VerticalPluginRegistry.discover("customer-service").resolve("customer-service")
+        is selected
+    )
+
+
+def test_incompatible_plugin_api_version_fails_fast() -> None:
+    with pytest.raises(ValueError, match="Core supports"):
+        VerticalPlugin(
+            "customer-service",
+            "customer_service",
+            build_empty_runtime,
+            api_version="999",
+        )

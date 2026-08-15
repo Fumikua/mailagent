@@ -6,6 +6,7 @@ __pycache__/
 .workspace/
 .worktrees/
 .superpowers/
+.split-repos-backup/
 .coverage
 data/
 config.yml

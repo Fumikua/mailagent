@@ -1,4 +1,5 @@
 """Resolve one installed vertical plugin and its external business profile."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -23,14 +24,18 @@ def load_selected_vertical(
     """Load an external business profile and match it to installed code."""
 
     vertical_dir = settings.id.replace("-", "_")
-    assets = load_vertical(Path(settings.verticals_path) / vertical_dir / "manifest.yaml")
+    assets = load_vertical(
+        Path(settings.verticals_path) / vertical_dir / "manifest.yaml"
+    )
     if assets.manifest.id != settings.id:
         raise VerticalConfigurationError(
             f"selected vertical id {settings.id!r} does not match profile "
             f"id {assets.manifest.id!r}"
         )
 
-    plugin = (registry or VerticalPluginRegistry.discover()).resolve(settings.id)
+    plugin = (registry or VerticalPluginRegistry.discover(settings.id)).resolve(
+        settings.id
+    )
     if plugin.namespace != assets.manifest.namespace:
         raise VerticalConfigurationError(
             f"vertical plugin {plugin.id!r} namespace {plugin.namespace!r} does not "

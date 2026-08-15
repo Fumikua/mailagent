@@ -36,6 +36,16 @@ classification_feedback:
   mode: disabled  # disabled | trusted_internal
   reviewer_identity_header: X-MailAgent-Reviewer-Id
 
+# HTTP control-plane authentication. Development may keep this disabled;
+# production configuration is rejected unless api_key mode is enabled.
+# Values are never stored here: only the environment-variable names are YAML.
+api_auth:
+  mode: disabled  # disabled | api_key
+  submitter_key_env: MAILAGENT_SUBMITTER_API_KEY
+  reviewer_key_env: MAILAGENT_REVIEWER_API_KEY
+  operator_key_env: MAILAGENT_OPERATOR_API_KEY
+  admin_key_env: MAILAGENT_ADMIN_API_KEY
+
 vertical:
   # Select exactly one installed vertical plugin by ID. verticals_path contains
   # its editable business profile (taxonomy, rules, signals and schemas), not code.

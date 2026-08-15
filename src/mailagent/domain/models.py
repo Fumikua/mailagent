@@ -38,7 +38,9 @@ class AttachmentMeta(BaseModel):
 
 class ProposedAction(BaseModel):
     id: UUID = Field(default_factory=uuid4)
-    type: Literal["add_label", "create_draft", "send_email", "forward_email", "delete_email"]
+    type: Literal[
+        "add_label", "create_draft", "send_email", "forward_email", "delete_email"
+    ]
     risk: Literal["low", "high"]
     requires_approval: bool
     status: Literal["proposed", "approved", "rejected", "blocked"] = "proposed"
@@ -121,7 +123,9 @@ class ThreadSegment(BaseModel):
 class RuleMatch(BaseModel):
     """A single rule match from RuleClassifier."""
 
-    rule_type: Literal["sender_domains", "subject_patterns", "body_keywords", "structural"]
+    rule_type: Literal[
+        "sender_domains", "subject_patterns", "body_keywords", "structural"
+    ]
     label: str
     confidence: float = Field(ge=0, le=1)
     matched_pattern: str
@@ -177,7 +181,13 @@ class FusionConflict(BaseModel):
 class FusionMeta(BaseModel):
     """Audit metadata for three-path fusion decisions."""
 
-    fusion_strategy: Literal["rule_only", "rule_vector_confirmed", "vector_only", "llm_fallback", "all_low_review"]
+    fusion_strategy: Literal[
+        "rule_only",
+        "rule_vector_confirmed",
+        "vector_only",
+        "llm_fallback",
+        "all_low_review",
+    ]
     source: Literal["rule", "vector", "llm"]
     confidence: float = Field(ge=0, le=1)
     rule_result: RuleResult | None = None
@@ -253,8 +263,6 @@ class ClassificationFeedbackRequest(BaseModel):
             raise ValueError("final labels must be non-empty canonical codes")
         if len(labels) != len(set(labels)):
             raise ValueError("final labels must be unique")
-        if "noise" in labels and len(labels) > 1:
-            raise ValueError("noise cannot be combined with a business label")
         return labels
 
     @field_validator("error_reasons")
@@ -323,9 +331,8 @@ class SampleRecord(BaseModel):
     def mark_legacy_three_level_records(self) -> "SampleRecord":
         """Keep callers that still provide L2/L3 readable but out of flat retrieval."""
 
-        if (
-            self.taxonomy_schema_version == "flat-v1"
-            and (self.label_l2 is not None or self.label_l3 is not None)
+        if self.taxonomy_schema_version == "flat-v1" and (
+            self.label_l2 is not None or self.label_l3 is not None
         ):
             self.taxonomy_schema_version = "legacy-v3"
         return self
@@ -350,7 +357,9 @@ class SkillDefinition(BaseModel):
     name: str = Field(min_length=3, pattern=r"^[a-z0-9][a-z0-9_-]*$")
     description: str
     instructions: list[str] = Field(default_factory=list)
-    allowed_actions: list[str] = Field(default_factory=lambda: ["add_label", "create_draft"])
+    allowed_actions: list[str] = Field(
+        default_factory=lambda: ["add_label", "create_draft"]
+    )
     enabled: bool = True
 
 

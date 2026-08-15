@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -9,6 +11,7 @@ from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel
+from sqlalchemy import text
 
 from ..infra.config import Settings
 from ..domain.models import (
@@ -23,12 +26,20 @@ from ..domain.models import (
     normalize_reviewer_identity,
 )
 from ..domain.policy import DefaultPolicyEngine
-from ..infra.queue import create_redis_pool, enqueue_classify
+from ..infra.queue import WORKER_HEARTBEAT_KEY, create_redis_pool, enqueue_classify
 from ..infra.migrations import upgrade_database
 from ..infra.vector_store import VectorStore
 from ..llm.taxonomy import TaxonomyLoader
 from ..verticals import load_selected_vertical
-from .service import MailProcessingService
+from .auth import (
+    ApiPrincipal,
+    require_admin,
+    require_operator,
+    require_reviewer,
+    require_submitter,
+    validate_api_auth_secrets,
+)
+from .service import InvalidRunTransition, MailProcessingService
 from ..infra.store import SqlStore
 
 logger = logging.getLogger(__name__)
@@ -37,6 +48,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = Settings.from_yaml()
+    validate_api_auth_secrets(settings.api_auth)
     await upgrade_database(settings.database.url)
     store = SqlStore(settings.database.url)
     app.state.settings = settings
@@ -79,6 +91,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="MailAgent API", version="0.1.0", lifespan=lifespan)
 
+_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+@app.middleware("http")
+async def request_context(request: Request, call_next):
+    """Attach a safe correlation ID and emit one request completion record."""
+
+    supplied = request.headers.get("x-request-id", "")
+    request_id = supplied if _REQUEST_ID_PATTERN.fullmatch(supplied) else uuid4().hex
+    request.state.request_id = request_id
+    started = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = round((time.perf_counter() - started) * 1000, 2)
+    response.headers["x-request-id"] = request_id
+    logger.info(
+        "request_completed request_id=%s method=%s path=%s status=%s duration_ms=%s",
+        request_id,
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
+    return response
+
 
 def service(request: Request) -> MailProcessingService:
     return request.app.state.service
@@ -106,7 +142,9 @@ def _require_feedback_enabled(request: Request) -> None:
         )
 
 
-def _trusted_reviewer_id(request: Request) -> str:
+def _trusted_reviewer_id(request: Request, principal: ApiPrincipal) -> str:
+    if request.app.state.settings.api_auth.mode == "api_key":
+        return principal.subject
     settings = request.app.state.settings.classification_feedback
     raw_identity = request.headers.get(settings.reviewer_identity_header)
     try:
@@ -123,22 +161,6 @@ def _trusted_reviewer_id(request: Request) -> str:
 # ---------------------------------------------------------------------------
 
 
-class BootstrapSeedRequest(BaseModel):
-    dir: str
-    force: bool = False
-    no_rules: bool = False
-
-
-class BootstrapImportRequest(BaseModel):
-    dir: str
-    batch_size: int = 50
-
-
-class BootstrapConfirmRequest(BaseModel):
-    report_id: str
-    confirmations: list[dict[str, Any]] = []
-
-
 class SampleLabelUpdate(BaseModel):
     label: str
 
@@ -149,8 +171,47 @@ async def healthz() -> dict[str, str]:
 
 
 @app.get("/readyz")
-async def readyz(request: Request) -> dict[str, str]:
-    return {"status": "ready", "environment": request.app.state.settings.environment}
+async def readyz(request: Request) -> dict[str, Any]:
+    checks: dict[str, str] = {}
+    try:
+        async with request.app.state.store.engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+        checks["database"] = "ok"
+    except Exception as exc:
+        checks["database"] = f"error:{type(exc).__name__}"
+
+    redis_pool = request.app.state.redis_pool
+    if redis_pool is None:
+        checks["redis"] = "unavailable"
+        checks["worker"] = "unknown"
+    else:
+        try:
+            await redis_pool.ping()
+            checks["redis"] = "ok"
+            checks["worker"] = (
+                "ok" if await redis_pool.get(WORKER_HEARTBEAT_KEY) else "stale"
+            )
+        except Exception as exc:
+            checks["redis"] = f"error:{type(exc).__name__}"
+            checks["worker"] = "unknown"
+
+    try:
+        taxonomy = request.app.state.taxonomy_loader.get_tree()
+        checks["vertical"] = "ok" if taxonomy.node_count() else "empty"
+    except Exception as exc:
+        checks["vertical"] = f"error:{type(exc).__name__}"
+
+    ready = all(value == "ok" for value in checks.values())
+    payload: dict[str, Any] = {
+        "status": "ready" if ready else "not_ready",
+        "environment": request.app.state.settings.environment,
+        "checks": checks,
+    }
+    if not ready:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=payload
+        )
+    return payload
 
 
 @app.post(
@@ -158,18 +219,26 @@ async def readyz(request: Request) -> dict[str, str]:
     response_model=RunResponse,
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def create_run(payload: CreateRunRequest, request: Request) -> RunResponse:
+async def create_run(
+    payload: CreateRunRequest,
+    request: Request,
+    principal: ApiPrincipal = Depends(require_submitter),
+) -> RunResponse:
     """提交邮件 → 立即创建 PENDING run + 入队 arq 任务 → 返回 run_id。
 
     Worker 后台调用 ClassifyAgent，完成后 status=COMPLETED + classification 字段写入。
     客户端轮询 GET /api/v1/runs/{run_id} 检查状态。
     """
 
-    return await service(request).create_run(payload)
+    return await service(request).create_run(payload, actor_id=principal.subject)
 
 
 @app.get("/api/v1/runs/{run_id}", response_model=RunResponse)
-async def get_run(run_id: UUID, request: Request) -> RunResponse:
+async def get_run(
+    run_id: UUID,
+    request: Request,
+    _: ApiPrincipal = Depends(require_submitter),
+) -> RunResponse:
     """查询 run：含完整 classification 字段（如 Worker 已处理完成）。
 
     status 可能值：pending / processing / completed / waiting_approval / rejected / failed
@@ -190,15 +259,19 @@ async def record_classification_feedback(
     run_id: UUID,
     payload: ClassificationFeedbackRequest,
     request: Request,
+    principal: ApiPrincipal = Depends(require_reviewer),
 ) -> ClassificationFeedback:
     _require_feedback_enabled(request)
-    reviewer_id = _trusted_reviewer_id(request)
-    valid_labels = request.app.state.taxonomy_loader.get_tree().all_codes()
+    reviewer_id = _trusted_reviewer_id(request, principal)
+    taxonomy = request.app.state.taxonomy_loader.get_tree()
+    valid_labels = taxonomy.all_codes()
+    exclusive_labels = {node.code for node in taxonomy.nodes if node.exclusive}
     try:
         feedback = await service(request).record_classification_feedback(
             run_id,
             payload,
             valid_labels=valid_labels,
+            exclusive_labels=exclusive_labels,
             reviewer_id=reviewer_id,
         )
     except ValueError as exc:
@@ -217,6 +290,7 @@ async def record_classification_feedback(
 async def list_classification_feedback(
     run_id: UUID,
     request: Request,
+    _: ApiPrincipal = Depends(require_reviewer),
 ) -> list[ClassificationFeedback]:
     _require_feedback_enabled(request)
     feedback = await service(request).list_classification_feedback(run_id)
@@ -226,41 +300,76 @@ async def list_classification_feedback(
 
 
 @app.post("/api/v1/runs/{run_id}/approve", response_model=RunResponse)
-async def approve_run(run_id: UUID, _: ApprovalRequest, request: Request) -> RunResponse:
-    run = await service(request).approve(run_id)
+async def approve_run(
+    run_id: UUID,
+    _: ApprovalRequest,
+    request: Request,
+    principal: ApiPrincipal = Depends(require_reviewer),
+) -> RunResponse:
+    try:
+        run = await service(request).approve(run_id, actor_id=principal.subject)
+    except InvalidRunTransition as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not run:
         raise HTTPException(status_code=404, detail="run not found")
     return run
 
 
 @app.post("/api/v1/runs/{run_id}/reject", response_model=RunResponse)
-async def reject_run(run_id: UUID, request: Request) -> RunResponse:
-    run = await service(request).reject(run_id)
+async def reject_run(
+    run_id: UUID,
+    request: Request,
+    principal: ApiPrincipal = Depends(require_reviewer),
+) -> RunResponse:
+    try:
+        run = await service(request).reject(run_id, actor_id=principal.subject)
+    except InvalidRunTransition as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not run:
         raise HTTPException(status_code=404, detail="run not found")
     return run
 
 
 @app.post("/api/v1/runs/{run_id}/retry", response_model=RunResponse)
-async def retry_run(run_id: UUID, request: Request) -> RunResponse:
-    run = await service(request).retry(run_id)
+async def retry_run(
+    run_id: UUID,
+    request: Request,
+    principal: ApiPrincipal = Depends(require_operator),
+) -> RunResponse:
+    try:
+        run = await service(request).retry(run_id, actor_id=principal.subject)
+    except InvalidRunTransition as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not run:
         raise HTTPException(status_code=404, detail="run not found")
     return run
 
 
 @app.get("/api/v1/skills", response_model=list[SkillVersion])
-async def list_skills(request: Request) -> list[SkillVersion]:
+async def list_skills(
+    request: Request,
+    _: ApiPrincipal = Depends(require_submitter),
+) -> list[SkillVersion]:
     return await store(request).list_skills()
 
 
-@app.post("/api/v1/skills", response_model=SkillVersion, status_code=status.HTTP_201_CREATED)
-async def create_skill(payload: SkillDefinition, request: Request) -> SkillVersion:
+@app.post(
+    "/api/v1/skills", response_model=SkillVersion, status_code=status.HTTP_201_CREATED
+)
+async def create_skill(
+    payload: SkillDefinition,
+    request: Request,
+    _: ApiPrincipal = Depends(require_admin),
+) -> SkillVersion:
     return await store(request).create_skill(payload)
 
 
 @app.post("/api/v1/skills/{skill_version_id}/publish", response_model=SkillVersion)
-async def publish_skill(skill_version_id: UUID, request: Request) -> SkillVersion:
+async def publish_skill(
+    skill_version_id: UUID,
+    request: Request,
+    _: ApiPrincipal = Depends(require_admin),
+) -> SkillVersion:
     skill = await store(request).publish_skill(skill_version_id)
     if not skill:
         raise HTTPException(status_code=404, detail="skill version not found")
@@ -272,64 +381,12 @@ async def publish_skill(skill_version_id: UUID, request: Request) -> SkillVersio
 # ---------------------------------------------------------------------------
 
 
-@app.post(
-    "/api/v1/bootstrap/seed",
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def bootstrap_seed(payload: BootstrapSeedRequest) -> dict[str, str]:
-    """Stage 1 seed labeling — returns a placeholder job_id with PENDING status.
-
-    Actual BootstrapPipeline execution requires injected dependencies
-    (rule_classifier / llm_classifier / embedding_client) and is deferred to
-    the CLI (``mailagent bootstrap seed``) or a future worker job. This
-    endpoint preserves the API contract so clients can be built against it.
-    """
-
-    job_id = uuid4().hex[:12]
-    logger.info(
-        "bootstrap seed requested: dir=%s force=%s no_rules=%s -> job_id=%s (deferred)",
-        payload.dir,
-        payload.force,
-        payload.no_rules,
-        job_id,
-    )
-    return {"job_id": job_id, "status": "pending"}
-
-
-@app.post(
-    "/api/v1/bootstrap/import",
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def bootstrap_import(payload: BootstrapImportRequest) -> dict[str, str]:
-    """Stage 2 incremental import — returns a placeholder job_id with PENDING status.
-
-    Like ``seed``, actual execution is deferred to the CLI / worker.
-    """
-
-    job_id = uuid4().hex[:12]
-    logger.info(
-        "bootstrap import requested: dir=%s batch_size=%s -> job_id=%s (deferred)",
-        payload.dir,
-        payload.batch_size,
-        job_id,
-    )
-    return {"job_id": job_id, "status": "pending"}
-
-
-@app.get("/api/v1/bootstrap/status/{job_id}")
-async def bootstrap_status(job_id: str) -> dict[str, Any]:
-    """Return the status of a bootstrap job.
-
-    Simplified placeholder: without an async job tracker the status is always
-    ``pending`` with no report_id. A future change will wire this to the
-    arq job registry.
-    """
-
-    return {"job_id": job_id, "status": "pending", "report_id": None}
-
-
 @app.get("/api/v1/bootstrap/report/{report_id}")
-async def bootstrap_report(report_id: str, request: Request) -> dict[str, Any]:
+async def bootstrap_report(
+    report_id: str,
+    request: Request,
+    _: ApiPrincipal = Depends(require_reviewer),
+) -> dict[str, Any]:
     """Return the markdown content and pending sample list for a bootstrap report.
 
     Reads ``bootstrap_{report_id}.md`` and ``bootstrap_{report_id}.json`` from
@@ -356,27 +413,13 @@ async def bootstrap_report(report_id: str, request: Request) -> dict[str, Any]:
     }
 
 
-@app.post("/api/v1/bootstrap/confirm")
-async def bootstrap_confirm(payload: BootstrapConfirmRequest) -> dict[str, Any]:
-    """Confirm samples from a bootstrap report.
-
-    Not implemented via the HTTP API: BootstrapPipeline needs injected
-    classifier/embedding dependencies that are not available in the API
-    process. Use the CLI (``mailagent bootstrap confirm``) instead.
-    """
-
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="bootstrap confirm is not implemented via API; use the CLI",
-    )
-
-
 @app.get("/api/v1/samples", response_model=list[SampleRecord])
 async def list_samples(
     label: str | None = None,
     source: str | None = None,
     page: int = 1,
     vs: VectorStore | None = Depends(get_vector_store),
+    _: ApiPrincipal = Depends(require_reviewer),
 ) -> list[SampleRecord]:
     """List labeled samples with optional label/source filters and pagination."""
 
@@ -389,6 +432,7 @@ async def list_samples(
 async def get_sample(
     sample_id: UUID,
     vs: VectorStore | None = Depends(get_vector_store),
+    _: ApiPrincipal = Depends(require_reviewer),
 ) -> SampleRecord:
     """Return a single sample by id."""
 
@@ -407,6 +451,7 @@ async def get_sample(
 async def delete_sample(
     sample_id: UUID,
     vs: VectorStore | None = Depends(get_vector_store),
+    _: ApiPrincipal = Depends(require_admin),
 ) -> dict[str, str]:
     """Delete a sample by id."""
 
@@ -424,6 +469,7 @@ async def update_sample_label(
     sample_id: UUID,
     payload: SampleLabelUpdate,
     vs: VectorStore | None = Depends(get_vector_store),
+    _: ApiPrincipal = Depends(require_admin),
 ) -> SampleRecord:
     """Update a sample's leaf label (label_l3) and mark it reviewed."""
 
@@ -440,7 +486,10 @@ async def update_sample_label(
 
 
 @app.get("/api/v1/clustering/report")
-async def clustering_report(request: Request) -> dict[str, str]:
+async def clustering_report(
+    request: Request,
+    _: ApiPrincipal = Depends(require_reviewer),
+) -> dict[str, str]:
     """Return the most recent intent-discovery clustering report.
 
     Scans the reports directory for ``intent_discovery_*.md`` files and

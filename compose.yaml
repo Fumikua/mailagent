@@ -8,7 +8,6 @@ services:
       MAILAGENT_REDIS__URL: redis://redis:6379/0
     volumes:
       - ./config.yml:/app/config.yml:ro
-      - ./taxonomy.yaml:/app/taxonomy.yaml:ro
       - ./verticals:/app/verticals:ro
       - ./data:/app/data:ro
     depends_on:
@@ -25,7 +24,6 @@ services:
       MAILAGENT_REDIS__URL: redis://redis:6379/0
     volumes:
       - ./config.yml:/app/config.yml:ro
-      - ./taxonomy.yaml:/app/taxonomy.yaml:ro
       - ./verticals:/app/verticals:ro
       - ./data:/app/data:ro
     depends_on:

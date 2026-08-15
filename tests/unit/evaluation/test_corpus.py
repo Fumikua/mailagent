@@ -102,8 +102,8 @@ def test_manifest_rejects_noise_with_business_label(tmp_path: Path) -> None:
         examples=[_example("a", labels=["noise", "schedule"])],
     )
 
-    with pytest.raises(ValueError, match="noise must be exclusive"):
-        load_gold_manifest(path, VALID_LABELS)
+    with pytest.raises(ValueError, match="label noise must be exclusive"):
+        load_gold_manifest(path, VALID_LABELS, {"noise"})
 
 
 def test_manifest_rejects_duplicate_sample_ids(tmp_path: Path) -> None:

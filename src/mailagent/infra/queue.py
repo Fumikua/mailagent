@@ -2,6 +2,7 @@
 
 API 立即返回 PENDING + run_id，Worker 后台调用 ClassifyAgent，更新 status=COMPLETED。
 """
+
 from __future__ import annotations
 
 import logging
@@ -21,6 +22,9 @@ RULE_LEARN_JOB_NAME = "rule_learn_job"
 ARCHIVE_JOB_NAME = "archive_job"
 MAIL_POLL_JOB_NAME = "mail_poll_job"
 CLEANUP_JOB_NAME = "cleanup_job"
+OUTBOX_DISPATCH_JOB_NAME = "outbox_dispatch_job"
+WORKER_HEARTBEAT_JOB_NAME = "worker_heartbeat_job"
+WORKER_HEARTBEAT_KEY = "mailagent:worker:heartbeat"
 
 _DEFAULT_BODY_MAX_CHARS = 16_000
 
@@ -92,7 +96,11 @@ def build_mail_understanding_pipeline(
                 taxonomy_loader=taxonomy_loader,
             )
             fusion_classifiers.insert(0, rule_classifier)
-        if loaded.rag is not None and embedding_client is not None and vector_store is not None:
+        if (
+            loaded.rag is not None
+            and embedding_client is not None
+            and vector_store is not None
+        ):
             vector_classifier = VectorClassifier(
                 vector_store,
                 embedding_client,
@@ -183,7 +191,12 @@ def redis_settings_from_url(url: str) -> RedisSettings:
     )
 
 
-async def enqueue_classify(redis: ArqRedis, run_id: str) -> str:
+async def enqueue_classify(
+    redis: ArqRedis,
+    run_id: str,
+    *,
+    job_id: str | None = None,
+) -> str:
     """入队 classify 任务，返回 job_id。
 
     Args:
@@ -194,8 +207,31 @@ async def enqueue_classify(redis: ArqRedis, run_id: str) -> str:
         str: arq job_id（入队失败返回空字符串）
     """
 
-    job = await redis.enqueue_job(CLASSIFY_JOB_NAME, run_id)
+    if job_id is None:
+        job = await redis.enqueue_job(CLASSIFY_JOB_NAME, run_id)
+    else:
+        job = await redis.enqueue_job(CLASSIFY_JOB_NAME, run_id, _job_id=job_id)
     return job.job_id if job else ""
+
+
+async def dispatch_outbox_item(redis: ArqRedis, store: Any, item: Any) -> str:
+    """Dispatch one durable outbox row with a deterministic Redis job id."""
+
+    if item.job_name != CLASSIFY_JOB_NAME:
+        error = f"unsupported outbox job: {item.job_name}"
+        await store.record_outbox_failure(item.id, error)
+        raise ValueError(error)
+    try:
+        run_id = str(item.payload["run_id"])
+        deterministic_id = f"outbox:{item.id}"
+        job_id = await enqueue_classify(redis, run_id, job_id=deterministic_id)
+        # arq returns None when this deterministic job already exists. That is
+        # a successful idempotent dispatch, not a reason to retry forever.
+        await store.mark_outbox_dispatched(item.id)
+        return job_id or deterministic_id
+    except Exception as exc:
+        await store.record_outbox_failure(item.id, str(exc))
+        raise
 
 
 async def classify_job(ctx: dict[str, Any], run_id: str) -> dict[str, Any]:
@@ -214,17 +250,29 @@ async def classify_job(ctx: dict[str, Any], run_id: str) -> dict[str, Any]:
     store = ctx["store"]
     pipeline = ctx.get("mail_understanding_pipeline")
     classify_agent = ctx.get("classify_agent")
-    service = ctx["service"]
     run_uuid = UUID(run_id)
 
-    # 1. 更新 status=PROCESSING
-    await store.update_run_status(run_uuid, RunStatus.PROCESSING)
+    # 1. 只有一个 worker 能认领 PENDING run；重复投递直接安全退出。
+    claimed = await store.transition_run_status(
+        run_uuid,
+        expected={RunStatus.PENDING},
+        target=RunStatus.PROCESSING,
+    )
+    if not claimed:
+        existing = await store.get_run(run_uuid)
+        if existing is None:
+            logger.error("run not found: %s", run_id)
+            return {"run_id": run_id, "status": "failed", "reason": "run not found"}
+        return {
+            "run_id": run_id,
+            "status": "ignored",
+            "reason": f"run is already {existing.status.value}",
+        }
 
     # 2. 加载 run
     run = await store.get_run(run_uuid)
     if run is None:
         logger.error("run not found: %s", run_id)
-        await store.update_run_status(run_uuid, RunStatus.FAILED)
         return {"run_id": run_id, "status": "failed", "reason": "run not found"}
 
     # 3. 调用新 Pipeline；旧 ClassifyAgent 仅保留给尚未迁移的测试/部署兼容。
@@ -240,14 +288,22 @@ async def classify_job(ctx: dict[str, Any], run_id: str) -> dict[str, Any]:
             raise RuntimeError("mail understanding pipeline is not configured")
     except Exception as exc:
         logger.exception("classify_job failed for run %s: %s", run_id, exc)
-        await store.update_run_status(run_uuid, RunStatus.FAILED)
+        await store.transition_run_status(
+            run_uuid,
+            expected={RunStatus.PROCESSING},
+            target=RunStatus.FAILED,
+        )
         return {"run_id": run_id, "status": "failed", "reason": str(exc)}
 
     # 4. 不可信输入与模型兜底结果都只能进入人工复核，不能自动完成。
-    review_required = classification.meta.needs_human_review or classification.meta.fallback
+    review_required = (
+        classification.meta.needs_human_review or classification.meta.fallback
+    )
     suspicious_instruction = _contains_prompt_injection(run.email.body)
     if suspicious_instruction:
-        logger.warning("prompt injection detected for run %s; holding for review", run_id)
+        logger.warning(
+            "prompt injection detected for run %s; holding for review", run_id
+        )
         review_required = True
 
     if review_required and not classification.meta.needs_human_review:
@@ -259,8 +315,20 @@ async def classify_job(ctx: dict[str, Any], run_id: str) -> dict[str, Any]:
             }
         )
 
-    final_status = RunStatus.WAITING_APPROVAL if review_required else RunStatus.COMPLETED
-    await service.update_classification(run_uuid, classification, status=final_status)
+    final_status = (
+        RunStatus.WAITING_APPROVAL if review_required else RunStatus.COMPLETED
+    )
+    updated = await store.complete_run_classification(
+        run_uuid,
+        classification,
+        status=final_status,
+    )
+    if not updated:
+        return {
+            "run_id": run_id,
+            "status": "ignored",
+            "reason": "run state changed before classification completed",
+        }
     return {
         "run_id": run_id,
         "status": final_status.value,
@@ -344,13 +412,20 @@ async def worker_on_startup(ctx: dict[str, Any]) -> None:
         fusion_components,
         loaded_vertical,
     )
-    if settings.fusion.enabled and embedding_client is not None and vector_store is not None:
+    if (
+        settings.fusion.enabled
+        and embedding_client is not None
+        and vector_store is not None
+    ):
         from .bootstrap import BootstrapPipeline
         from .clustering import ClusteringEngine
         from .rule_learner import RuleLearner
 
         ctx["clustering_engine"] = ClusteringEngine(
-            vector_store, fusion_components["taxonomy_loader"], llm_client, settings.clustering
+            vector_store,
+            fusion_components["taxonomy_loader"],
+            llm_client,
+            settings.clustering,
         )
         rule_classifier = fusion_components.get("rule_classifier")
         if rule_classifier is not None and loaded_vertical.rules is not None:
@@ -381,13 +456,17 @@ async def worker_on_startup(ctx: dict[str, Any]) -> None:
     ctx["vertical_runtime"] = vertical_runtime
     ctx.update(fusion_components)
     if vertical_runtime.compatibility_projector is not None:
-        ctx["classification_compatibility_projector"] = vertical_runtime.compatibility_projector
+        ctx["classification_compatibility_projector"] = (
+            vertical_runtime.compatibility_projector
+        )
     ctx["service"] = service
     ctx["settings"] = settings
     if any(gw.enabled for gw in settings.mail_gateways):
         from ..gateway.state import MailGatewayStateStore
 
         ctx["mail_gateway_state"] = MailGatewayStateStore(store.engine)
+    if redis := ctx.get("redis"):
+        await redis.set(WORKER_HEARTBEAT_KEY, "1", ex=90)
     logger.info(
         "arq worker started: vertical=%s, enrichers=%s, fusion=%s",
         settings.vertical.id,
@@ -448,7 +527,9 @@ async def archive_job(ctx: dict[str, Any]) -> str:
     if pipeline is None:
         return "skipped: fusion disabled"
     settings = ctx["settings"]
-    archived = await pipeline.archive_old_samples(settings.vector_store.archive_window_months)
+    archived = await pipeline.archive_old_samples(
+        settings.vector_store.archive_window_months
+    )
     return f"archived: {archived}"
 
 
@@ -476,7 +557,39 @@ async def cleanup_job(ctx: dict[str, Any]) -> str:
     return f"cleanup: {summary}"
 
 
+async def outbox_dispatch_job(ctx: dict[str, Any]) -> str:
+    """Retry durable enqueue intents left by API/Redis partial failures."""
+
+    store = ctx.get("store")
+    redis = ctx.get("redis")
+    if store is None or redis is None:
+        return "skipped: store or redis unavailable"
+    pending = await store.list_pending_outbox(limit=100)
+    dispatched = 0
+    failed = 0
+    for item in pending:
+        try:
+            await dispatch_outbox_item(redis, store, item)
+            dispatched += 1
+        except Exception:
+            failed += 1
+            logger.exception("outbox dispatch failed: outbox_id=%s", item.id)
+    return f"outbox: dispatched={dispatched}, failed={failed}"
+
+
+async def worker_heartbeat_job(ctx: dict[str, Any]) -> str:
+    """Publish a short-lived marker used by API readiness checks."""
+
+    redis = ctx.get("redis")
+    if redis is None:
+        return "skipped: redis unavailable"
+    await redis.set(WORKER_HEARTBEAT_KEY, "1", ex=90)
+    return "worker heartbeat refreshed"
+
+
 cron_jobs = [
+    cron(worker_heartbeat_job, name=WORKER_HEARTBEAT_JOB_NAME, minute=set(range(60))),
+    cron(outbox_dispatch_job, name=OUTBOX_DISPATCH_JOB_NAME, minute=set(range(60))),
     cron(clustering_job, name=CLUSTERING_JOB_NAME, weekday="sun", hour=2, minute=0),
     cron(rule_learn_job, name=RULE_LEARN_JOB_NAME, weekday="sun", hour=3, minute=0),
     cron(archive_job, name=ARCHIVE_JOB_NAME, day=1, hour=2, minute=0),

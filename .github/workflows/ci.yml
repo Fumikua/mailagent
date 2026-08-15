@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: mailagent
+          POSTGRES_PASSWORD: mailagent
+          POSTGRES_DB: mailagent
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U mailagent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras --locked
+      - run: uv run ruff check .
+      - run: uv run mypy src/mailagent
+      - run: uv run pytest -q
+      - name: PostgreSQL migration smoke
+        env:
+          DATABASE_URL: postgresql+asyncpg://mailagent:mailagent@localhost:5432/mailagent
+        run: uv run python -c "import asyncio,os; from mailagent.infra.migrations import upgrade_database; asyncio.run(upgrade_database(os.environ['DATABASE_URL']))"
+      - name: Redis connectivity smoke
+        run: uv run python -c "import asyncio; from redis.asyncio import Redis; asyncio.run(Redis.from_url('redis://localhost:6379/0').ping())"
+      - name: Public example vertical validation
+        env:
+          MAILAGENT_VERTICAL__ID: example-triage
+        run: uv run mailagent vertical validate --json
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - name: Installed-wheel migration smoke
+        run: |
+          python -m venv /tmp/mailagent-wheel-smoke
+          /tmp/mailagent-wheel-smoke/bin/pip install dist/mailagent-*.whl
+          /tmp/mailagent-wheel-smoke/bin/python -c "import asyncio,tempfile; from pathlib import Path; from mailagent.infra.migrations import upgrade_database; p=Path(tempfile.mkdtemp())/'smoke.db'; asyncio.run(upgrade_database(f'sqlite+aiosqlite:///{p}'))"
+      - run: docker build -t mailagent-core-ci .

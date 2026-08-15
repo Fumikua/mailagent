@@ -9,4 +9,3 @@
 - pattern: "automatic reply|delivery status notification"
   label: automated
   confidence: 0.90
-

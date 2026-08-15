@@ -1,2 +1,1 @@
 """MailAgent runtime package."""
-

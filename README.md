@@ -1,11 +1,10 @@
 # MailAgent
 
-A vertical-agnostic mail classification and automation runtime. Core owns generic
-classification, fusion, audit, and a mail-understanding pipeline; each **vertical**
-is an installable plugin that contributes executable enrichers plus an externally
-editable business profile (taxonomy, rules, signals, schemas). The Worker depends
-only on the generic plugin contract, so a new domain is added as a plugin — not by
-patching Core.
+A public, vertical-agnostic mail classification and automation runtime. Core owns
+generic classification, fusion, audit, and a mail-understanding pipeline; each
+**vertical** remains an independently buildable plugin that contributes executable
+enrichers plus an externally editable business profile (taxonomy, rules, signals,
+schemas).
 
 > The shipped `example_triage` vertical is a minimal sample (3-label taxonomy) for
 > demonstration. Build your own vertical package for real business domains.
@@ -101,7 +100,7 @@ mailagent/
 ├── verticals/
 │   └── example_triage/   # Sample vertical: manifest, taxonomy, rules, data-schema
 ├── examples/
-│   └── vertical-plugin-template/ # Copyable, independently buildable plugin example
+│   └── vertical-plugin-template/ # Copyable, independently buildable public plugin example
 ├── config.example.yml
 ├── compose.yaml
 └── pyproject.toml
@@ -110,7 +109,8 @@ mailagent/
 To create a separately installable vertical, copy
 [`examples/vertical-plugin-template`](examples/vertical-plugin-template). It
 demonstrates the Python entry point, external profile layout, tests, and an
-independent wheel without adding the example package to the Core wheel.
+independent wheel without adding the example package to the Core workspace or
+Core wheel.
 
 ## Quick Start
 
@@ -118,8 +118,7 @@ independent wheel without adding the example package to the Core wheel.
 
 ```bash
 cp config.example.yml config.yml
-python3.11 -m venv .venv
-.venv/bin/python -m pip install -e '.[dev]'
+uv sync --all-packages --all-extras
 ```
 
 ### 2. Start Redis (required by the Worker)
@@ -326,15 +325,15 @@ pulls `classify_job` tasks from Redis and processes them.
 
 ## Tests
 
-The public suite uses only the synthetic `example_triage` plugin and includes an
+The Core suite uses only the synthetic `example_triage` plugin and includes an
 architecture regression gate that rejects private-vertical vocabulary and
-business fields in the runtime:
+business fields in Core. Independently installed plugins run their own suites:
 
 ```bash
-pytest -q
-ruff check .
-mypy src/mailagent
-MAILAGENT_VERTICAL__ID=example-triage mailagent vertical validate --json
+uv run pytest -q
+uv run ruff check .
+uv run mypy src/mailagent
+MAILAGENT_VERTICAL__ID=example-triage uv run mailagent vertical validate --json
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before adding a classifier, field, asset
@@ -342,7 +341,8 @@ schema, or vertical capability.
 
 ## Hard Constraints
 
-- Backend passes `ruff check .` and `mypy src/mailagent` with zero issues.
+- Core passes Ruff, mypy, and pytest; plugin packages validate against the same
+  public contracts in their own repositories.
 - All high-risk actions (send / forward / delete) remain proposed only — never
   executed without explicit human approval.
 - Untrusted email bodies never gain instruction priority; prompt-injection

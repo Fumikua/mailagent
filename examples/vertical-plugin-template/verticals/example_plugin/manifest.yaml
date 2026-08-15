@@ -7,4 +7,3 @@ rules:
   path: rules
   version: "1"
 enrichers: []
-

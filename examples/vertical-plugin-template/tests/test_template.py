@@ -25,4 +25,3 @@ def test_template_builds_a_valid_classification_only_runtime() -> None:
 
     assert isinstance(runtime, VerticalRuntime)
     assert runtime.enrichers == []
-

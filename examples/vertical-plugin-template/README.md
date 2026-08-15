@@ -46,4 +46,3 @@ MAILAGENT_VERTICAL__ID=example-plugin \
 MAILAGENT_VERTICAL__VERTICALS_PATH=/absolute/path/to/vertical-plugin-template/verticals \
 mailagent vertical validate --json
 ```
-

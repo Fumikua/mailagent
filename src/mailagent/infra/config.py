@@ -60,6 +60,40 @@ class ClassificationFeedbackSettings(BaseModel):
         return value
 
 
+class ApiAuthSettings(BaseModel):
+    """Bearer-key role boundary; values are read only from environment variables."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["disabled", "api_key"] = "disabled"
+    submitter_key_env: str = "MAILAGENT_SUBMITTER_API_KEY"
+    reviewer_key_env: str = "MAILAGENT_REVIEWER_API_KEY"
+    operator_key_env: str = "MAILAGENT_OPERATOR_API_KEY"
+    admin_key_env: str = "MAILAGENT_ADMIN_API_KEY"
+
+    @field_validator(
+        "submitter_key_env",
+        "reviewer_key_env",
+        "operator_key_env",
+        "admin_key_env",
+    )
+    @classmethod
+    def _validate_env_name(cls, value: str) -> str:
+        if not value or not value.replace("_", "A").isalnum() or value.upper() != value:
+            raise ValueError(
+                "API key environment names must use uppercase letters, digits, and underscores"
+            )
+        return value
+
+    def role_key_envs(self) -> dict[str, str]:
+        return {
+            "submitter": self.submitter_key_env,
+            "reviewer": self.reviewer_key_env,
+            "operator": self.operator_key_env,
+            "admin": self.admin_key_env,
+        }
+
+
 class VerticalSettings(BaseModel):
     """Selects installed vertical code and its external business profile.
 
@@ -233,6 +267,7 @@ class Settings(BaseSettings):
     classification_feedback: ClassificationFeedbackSettings = Field(
         default_factory=ClassificationFeedbackSettings
     )
+    api_auth: ApiAuthSettings = Field(default_factory=ApiAuthSettings)
     vertical: VerticalSettings = Field(default_factory=VerticalSettings)
     vertical_overrides: dict[str, Any] = Field(default_factory=dict)
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
@@ -249,6 +284,11 @@ class Settings(BaseSettings):
         ids = [gw.mailbox_id for gw in self.mail_gateways if gw.enabled]
         if len(ids) != len(set(ids)):
             raise ValueError("duplicate mailbox_id among enabled mail_gateways")
+        if (
+            self.environment.casefold() in {"production", "prod"}
+            and self.api_auth.mode == "disabled"
+        ):
+            raise ValueError("production requires api_auth.mode='api_key'")
         return self
 
     @classmethod

@@ -38,9 +38,7 @@ class GoldExample(BaseModel):
         if len(references) != len(set(references)):
             raise ValueError("annotation_refs must be unique")
         if any(not reference for reference in references):
-            raise ValueError(
-                "examples require two independent annotation references"
-            )
+            raise ValueError("examples require two independent annotation references")
         return references
 
     @field_validator("adjudicated")
@@ -73,7 +71,11 @@ class PredictionRecord(BaseModel):
     versions: ClassificationVersions
 
 
-def load_gold_manifest(path: Path, valid_labels: set[str]) -> GoldCorpusManifest:
+def load_gold_manifest(
+    path: Path,
+    valid_labels: set[str],
+    exclusive_labels: set[str] | None = None,
+) -> GoldCorpusManifest:
     """Load and validate an authorized gold corpus manifest.
 
     ``valid_labels`` is supplied by the active taxonomy so the manifest never
@@ -82,6 +84,7 @@ def load_gold_manifest(path: Path, valid_labels: set[str]) -> GoldCorpusManifest
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     manifest = GoldCorpusManifest.model_validate(raw)
 
+    exclusive = exclusive_labels or set()
     sample_ids: set[str] = set()
     thread_splits: dict[str, str] = {}
     for example in manifest.examples:
@@ -93,8 +96,9 @@ def load_gold_manifest(path: Path, valid_labels: set[str]) -> GoldCorpusManifest
         if unknown_labels:
             raise ValueError(f"unknown label: {sorted(unknown_labels)[0]}")
 
-        if "noise" in example.labels and len(example.labels) != 1:
-            raise ValueError("noise must be exclusive")
+        selected_exclusive = sorted(set(example.labels) & exclusive)
+        if selected_exclusive and len(set(example.labels)) != 1:
+            raise ValueError(f"label {selected_exclusive[0]} must be exclusive")
 
         if len(set(example.annotation_refs)) < 2 or any(
             not reference.strip() for reference in example.annotation_refs
@@ -112,7 +116,9 @@ def load_gold_manifest(path: Path, valid_labels: set[str]) -> GoldCorpusManifest
 
 
 def load_prediction_snapshot(
-    path: Path, valid_labels: set[str]
+    path: Path,
+    valid_labels: set[str],
+    exclusive_labels: set[str] | None = None,
 ) -> list[PredictionRecord]:
     """Load a saved prediction snapshot without invoking classification providers.
 
@@ -131,11 +137,15 @@ def load_prediction_snapshot(
     if not isinstance(rows, list):
         raise ValueError("prediction snapshot predictions must be a list")
 
+    exclusive = exclusive_labels or set()
     predictions = [PredictionRecord.model_validate(row) for row in rows]
     for prediction in predictions:
         unknown_labels = set(prediction.labels) - valid_labels
         if unknown_labels:
             raise ValueError(f"unknown prediction label: {sorted(unknown_labels)[0]}")
-        if "noise" in prediction.labels and len(set(prediction.labels)) != 1:
-            raise ValueError("prediction noise label must be exclusive")
+        selected_exclusive = sorted(set(prediction.labels) & exclusive)
+        if selected_exclusive and len(set(prediction.labels)) != 1:
+            raise ValueError(
+                f"prediction label {selected_exclusive[0]} must be exclusive"
+            )
     return predictions

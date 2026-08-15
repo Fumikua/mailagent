@@ -9,6 +9,7 @@ Subcommands:
 Factory functions ``_build_pipeline`` and ``_build_vector_store`` are
 module-level so tests can monkeypatch them without touching real I/O.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -70,7 +71,9 @@ def _build_pipeline() -> BootstrapPipeline:
         from mailagent.classification.taxonomy import TaxonomyLoader
 
         taxonomy_loader = TaxonomyLoader(settings.classification.taxonomy_path)
-        llm_classifier: Any = LLMClassifier(llm_client, taxonomy_loader, settings.model.model_name)
+        llm_classifier: Any = LLMClassifier(
+            llm_client, taxonomy_loader, settings.model.model_name
+        )
     except Exception:
         llm_classifier = LLMClassifier(llm_client, None, settings.model.model_name)  # type: ignore[arg-type]
 
@@ -212,10 +215,21 @@ def classification_evaluate(
     loaded_vertical = load_selected_vertical(settings.vertical).assets
     taxonomy = load_taxonomy(loaded_vertical.taxonomy_path)
     valid_labels = taxonomy.all_codes()
+    exclusive_labels = {node.code for node in taxonomy.nodes if node.exclusive}
 
-    manifest = load_gold_manifest(manifest_path, valid_labels)
-    predictions = load_prediction_snapshot(predictions_path, valid_labels)
-    report = evaluate_predictions(manifest, predictions, ReleaseGate())
+    manifest = load_gold_manifest(manifest_path, valid_labels, exclusive_labels)
+    predictions = load_prediction_snapshot(
+        predictions_path,
+        valid_labels,
+        exclusive_labels,
+    )
+    report = evaluate_predictions(
+        manifest,
+        predictions,
+        ReleaseGate(
+            label_precision_overrides={label: 0.99 for label in exclusive_labels}
+        ),
+    )
     json_path, markdown_path = write_evaluation_reports(report, output_dir)
 
     reasons = ", ".join(report.gate.reason_codes) or "none"
@@ -240,9 +254,19 @@ def bootstrap() -> None:
 
 
 @bootstrap.command("seed")
-@click.option("--dir", "dir_", type=click.Path(exists=True, path_type=Path), required=True)
-@click.option("--force", is_flag=True, default=False, help="Overwrite existing mail_hash samples.")
-@click.option("--no-rules", "no_rules", is_flag=True, default=False, help="Skip empty-rules warning.")
+@click.option(
+    "--dir", "dir_", type=click.Path(exists=True, path_type=Path), required=True
+)
+@click.option(
+    "--force", is_flag=True, default=False, help="Overwrite existing mail_hash samples."
+)
+@click.option(
+    "--no-rules",
+    "no_rules",
+    is_flag=True,
+    default=False,
+    help="Skip empty-rules warning.",
+)
 def bootstrap_seed(dir_: Path, force: bool, no_rules: bool) -> None:
     """Stage 1: seed labeling with LLM full annotation."""
     pipeline = _build_pipeline()
@@ -251,8 +275,12 @@ def bootstrap_seed(dir_: Path, force: bool, no_rules: bool) -> None:
 
 
 @bootstrap.command("import")
-@click.option("--dir", "dir_", type=click.Path(exists=True, path_type=Path), required=True)
-@click.option("--batch-size", "batch_size", type=int, default=50, help="Emails per batch.")
+@click.option(
+    "--dir", "dir_", type=click.Path(exists=True, path_type=Path), required=True
+)
+@click.option(
+    "--batch-size", "batch_size", type=int, default=50, help="Emails per batch."
+)
 def bootstrap_import(dir_: Path, batch_size: int) -> None:
     """Stage 2: incremental import with tiered labeling."""
     pipeline = _build_pipeline()
@@ -261,7 +289,9 @@ def bootstrap_import(dir_: Path, batch_size: int) -> None:
 
 
 @bootstrap.command("review")
-@click.option("--report-id", "report_id", required=True, help="Report ID from seed/import.")
+@click.option(
+    "--report-id", "report_id", required=True, help="Report ID from seed/import."
+)
 @click.option("--tier", "tier", required=True, help="Tier to review (1, 2, or 3).")
 def bootstrap_review(report_id: str, tier: str) -> None:
     """Interactive review of bootstrap samples (like git rebase -i)."""
@@ -270,10 +300,22 @@ def bootstrap_review(report_id: str, tier: str) -> None:
 
 
 @bootstrap.command("confirm")
-@click.option("--report-id", "report_id", required=True, help="Report ID from seed/import.")
-@click.option("--tier", "tier", type=int, required=True, help="Tier to confirm (1, 2, or 3).")
-@click.option("--all", "all_", is_flag=True, default=False, help="Batch-confirm all tier samples.")
-@click.option("--dry-run", "dry_run", is_flag=True, default=False, help="Preview without DB writes.")
+@click.option(
+    "--report-id", "report_id", required=True, help="Report ID from seed/import."
+)
+@click.option(
+    "--tier", "tier", type=int, required=True, help="Tier to confirm (1, 2, or 3)."
+)
+@click.option(
+    "--all", "all_", is_flag=True, default=False, help="Batch-confirm all tier samples."
+)
+@click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    default=False,
+    help="Preview without DB writes.",
+)
 def bootstrap_confirm(report_id: str, tier: int, all_: bool, dry_run: bool) -> None:
     """Confirm samples from a bootstrap report."""
     if tier == 2 or (all_ and tier == 3):
@@ -303,12 +345,16 @@ def bootstrap_confirm(report_id: str, tier: int, all_: bool, dry_run: bool) -> N
 
 
 @bootstrap.command("archive")
-@click.option("--months", type=int, default=12, help="Archive samples older than N months.")
+@click.option(
+    "--months", type=int, default=12, help="Archive samples older than N months."
+)
 def bootstrap_archive(months: int) -> None:
     """Move old samples to the archive table."""
     pipeline = _build_pipeline()
     count = asyncio.run(pipeline.archive_old_samples(months=months))
-    console.print(f"[green]Archived {count} samples[/green] (older than {months} months).")
+    console.print(
+        f"[green]Archived {count} samples[/green] (older than {months} months)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -368,12 +414,18 @@ def samples_delete(id_: str) -> None:
 def samples_fix(id_: str, label: str) -> None:
     """Fix a sample's label (source=human_fix, confidence=1.0)."""
     store = _build_vector_store()
-    asyncio.run(store.update_sample_label(uuid.UUID(id_), label, source="human_fix", confidence=1.0))
+    asyncio.run(
+        store.update_sample_label(
+            uuid.UUID(id_), label, source="human_fix", confidence=1.0
+        )
+    )
     console.print(f"[green]Fixed sample[/green] {id_} → label_l3={label}")
 
 
 @samples.command("audit")
-@click.option("--ratio", type=float, default=0.1, help="Fraction of unreviewed samples to audit.")
+@click.option(
+    "--ratio", type=float, default=0.1, help="Fraction of unreviewed samples to audit."
+)
 def samples_audit(ratio: float) -> None:
     """Audit a random fraction of unreviewed samples."""
     import random
@@ -539,7 +591,12 @@ def rules() -> None:
 
 
 @rules.command("add")
-@click.option("--from-report", "from_report", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--from-report",
+    "from_report",
+    required=True,
+    type=click.Path(exists=True, path_type=Path),
+)
 def rules_add(from_report: Path) -> None:
     """Apply checked sender-domain proposals from a Markdown report."""
     settings = _build_settings()
@@ -553,15 +610,15 @@ def rules_add(from_report: Path) -> None:
                 f"selected vertical {loaded_vertical.manifest.id} has no rules asset"
             )
         rules_dir = loaded_vertical.rules.path
-        taxonomy_snapshot = TaxonomyLoader(
-            loaded_vertical.taxonomy_path
-        ).get_snapshot()
+        taxonomy_snapshot = TaxonomyLoader(loaded_vertical.taxonomy_path).get_snapshot()
         added = append_confirmed_sender_domain_rules(
             from_report, rules_dir, taxonomy_snapshot
         )
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
-    console.print(f"[green]Added {added} rules[/green] to {rules_dir / 'sender_domains.yaml'}")
+    console.print(
+        f"[green]Added {added} rules[/green] to {rules_dir / 'sender_domains.yaml'}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -576,7 +633,9 @@ async def _run_review(pipeline: BootstrapPipeline, report_id: str, tier: str) ->
     tier_samples = [s for s in report["samples"] if s["tier"] == tier_key]
 
     if not tier_samples:
-        console.print(f"[yellow]No samples found for {tier_key} in report {report_id}.[/yellow]")
+        console.print(
+            f"[yellow]No samples found for {tier_key} in report {report_id}.[/yellow]"
+        )
         return
 
     console.print(f"[bold]Reviewing {len(tier_samples)} samples for {tier_key}[/bold]")
@@ -600,8 +659,10 @@ async def _run_review(pipeline: BootstrapPipeline, report_id: str, tier: str) ->
         )
 
         if action == "q":
-            console.print(f"\n[yellow]Save and quit.[/yellow] "
-                          f"Confirmed: {confirmed}, Discarded: {discarded}, Skipped: {skipped}")
+            console.print(
+                f"\n[yellow]Save and quit.[/yellow] "
+                f"Confirmed: {confirmed}, Discarded: {discarded}, Skipped: {skipped}"
+            )
             return
 
         if action == "d":
@@ -626,7 +687,9 @@ async def _run_review(pipeline: BootstrapPipeline, report_id: str, tier: str) ->
                 "reasoning": "human_edit",
             }
             entry["action"] = "edited"
-            await _persist_entry(pipeline, entry, report.get("stage", "import"), is_edit=True)
+            await _persist_entry(
+                pipeline, entry, report.get("stage", "import"), is_edit=True
+            )
             confirmed += 1
             console.print(f"  [green]Confirmed with edit:[/green] {new_label}\n")
             continue
@@ -635,7 +698,9 @@ async def _run_review(pipeline: BootstrapPipeline, report_id: str, tier: str) ->
             entry["retrieval_text_override"] = Prompt.ask("  New retrieval text")
             entry["override_reason"] = Prompt.ask("  Override reason")
             entry["action"] = "retrieval_text_edited"
-            await _persist_entry(pipeline, entry, report.get("stage", "import"), is_edit=True)
+            await _persist_entry(
+                pipeline, entry, report.get("stage", "import"), is_edit=True
+            )
             confirmed += 1
             console.print("  [green]Confirmed with retrieval-text override.[/green]\n")
             continue
@@ -679,7 +744,9 @@ def _display_sample(entry: dict[str, Any], index: int, total: int) -> None:
     else:
         lines.append("[bold]LLM suggestion:[/bold] [dim]unavailable[/dim]")
 
-    lines.append(f"[bold]Consistency:[/bold] {'✓' if entry.get('consistency') else '✗'}")
+    lines.append(
+        f"[bold]Consistency:[/bold] {'✓' if entry.get('consistency') else '✗'}"
+    )
     if entry.get("tier") == "tier2":
         lines.append(
             f"[bold]Verification:[/bold] "
@@ -687,12 +754,8 @@ def _display_sample(entry: dict[str, Any], index: int, total: int) -> None:
         )
         verification_detail = entry.get("verification_detail")
         if verification_detail:
-            lines.append(
-                f"[bold]Verification detail:[/bold] {verification_detail}"
-            )
-        lines.append(
-            "[yellow]Mandatory individual review before persistence.[/yellow]"
-        )
+            lines.append(f"[bold]Verification detail:[/bold] {verification_detail}")
+        lines.append("[yellow]Mandatory individual review before persistence.[/yellow]")
 
     body_preview = entry.get("body_preview", "")
     lines.append(f"\n[dim]Body preview:[/dim]\n{body_preview}")

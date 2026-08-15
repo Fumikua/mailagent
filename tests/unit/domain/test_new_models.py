@@ -1,4 +1,5 @@
 """Unit tests for vector-similarity-path-b domain models."""
+
 from __future__ import annotations
 
 
@@ -29,10 +30,6 @@ from mailagent.domain.models import (
             "error_reasons": ["wrong_label"],
         },
         {"final_labels": [" schedule"], "error_reasons": ["wrong_label"]},
-        {
-            "final_labels": ["noise", "schedule"],
-            "error_reasons": ["wrong_label"],
-        },
         {"final_labels": ["schedule"], "error_reasons": []},
         {
             "final_labels": ["schedule"],
@@ -59,7 +56,9 @@ def test_classification_feedback_request_rejects_invalid_domain_input(
 
 class TestNormalizedSubject:
     def test_field_population(self):
-        ns = NormalizedSubject(raw="Re: Re: Example Berlin STATUS", clean="Example Berlin STATUS")
+        ns = NormalizedSubject(
+            raw="Re: Re: Example Berlin STATUS", clean="Example Berlin STATUS"
+        )
         assert ns.raw == "Re: Re: Example Berlin STATUS"
         assert ns.clean == "Example Berlin STATUS"
         assert ns.model_dump() == {
@@ -84,8 +83,18 @@ class TestThreadSegment:
 class TestRuleResult:
     def test_conflict_resolution_selected_single(self):
         matches = [
-            RuleMatch(rule_type="sender_domains", label="locationing", confidence=0.95, matched_pattern="@example.com"),
-            RuleMatch(rule_type="subject_patterns", label="arrival", confidence=0.80, matched_pattern="STATUS.*"),
+            RuleMatch(
+                rule_type="sender_domains",
+                label="locationing",
+                confidence=0.95,
+                matched_pattern="@example.com",
+            ),
+            RuleMatch(
+                rule_type="subject_patterns",
+                label="arrival",
+                confidence=0.80,
+                matched_pattern="STATUS.*",
+            ),
         ]
         result = RuleResult(matches=matches, selected=matches[0], conflict_logged=True)
         assert result.selected is not None
@@ -108,8 +117,20 @@ class TestPathBResult:
 
     def test_with_candidates(self):
         candidates = [
-            PathBCandidate(label="locationing", max_similarity=0.92, count=3, mean_similarity=0.88, confidence=0.90),
-            PathBCandidate(label="arrival", max_similarity=0.85, count=2, mean_similarity=0.82, confidence=0.83),
+            PathBCandidate(
+                label="locationing",
+                max_similarity=0.92,
+                count=3,
+                mean_similarity=0.88,
+                confidence=0.90,
+            ),
+            PathBCandidate(
+                label="arrival",
+                max_similarity=0.85,
+                count=2,
+                mean_similarity=0.82,
+                confidence=0.83,
+            ),
         ]
         result = PathBResult(
             candidates=candidates,
@@ -124,22 +145,46 @@ class TestPathBResult:
 class TestFusionMeta:
     @pytest.mark.parametrize(
         "strategy",
-        ["rule_only", "rule_vector_confirmed", "vector_only", "llm_fallback", "all_low_review"],
+        [
+            "rule_only",
+            "rule_vector_confirmed",
+            "vector_only",
+            "llm_fallback",
+            "all_low_review",
+        ],
     )
     def test_all_strategies(self, strategy: str):
         fm = FusionMeta(
             fusion_strategy=strategy,
-            source="rule" if "rule" in strategy else "vector" if "vector" in strategy else "llm",
+            source="rule"
+            if "rule" in strategy
+            else "vector"
+            if "vector" in strategy
+            else "llm",
             confidence=0.85,
         )
         assert fm.fusion_strategy == strategy
 
     def test_with_rule_result(self):
         rr = RuleResult(
-            matches=[RuleMatch(rule_type="sender_domains", label="locationing", confidence=0.95, matched_pattern="@x.com")],
-            selected=RuleMatch(rule_type="sender_domains", label="locationing", confidence=0.95, matched_pattern="@x.com"),
+            matches=[
+                RuleMatch(
+                    rule_type="sender_domains",
+                    label="locationing",
+                    confidence=0.95,
+                    matched_pattern="@x.com",
+                )
+            ],
+            selected=RuleMatch(
+                rule_type="sender_domains",
+                label="locationing",
+                confidence=0.95,
+                matched_pattern="@x.com",
+            ),
         )
-        fm = FusionMeta(fusion_strategy="rule_only", source="rule", confidence=0.95, rule_result=rr)
+        fm = FusionMeta(
+            fusion_strategy="rule_only", source="rule", confidence=0.95, rule_result=rr
+        )
         assert fm.rule_result is not None
         assert fm.rule_result.selected is not None
         assert fm.vector_confirmed is False
@@ -240,14 +285,18 @@ class TestSampleRecord:
 class TestClassificationResponseFusionMeta:
     def test_fusion_meta_none_backward_compatible(self):
         resp = ClassificationResponse(
-            labels=[TaxonomyLabel(l1_code="ops", l1_label="Operations", confidence=0.9)],
+            labels=[
+                TaxonomyLabel(l1_code="ops", l1_label="Operations", confidence=0.9)
+            ],
         )
         assert resp.fusion_meta is None
 
     def test_fusion_meta_populated(self):
         fm = FusionMeta(fusion_strategy="rule_only", source="rule", confidence=0.95)
         resp = ClassificationResponse(
-            labels=[TaxonomyLabel(l1_code="ops", l1_label="Operations", confidence=0.95)],
+            labels=[
+                TaxonomyLabel(l1_code="ops", l1_label="Operations", confidence=0.95)
+            ],
             fusion_meta=fm,
         )
         assert resp.fusion_meta is not None

@@ -6,6 +6,7 @@ migration，而不只是为全新数据库创建缺失的表。
 from __future__ import annotations
 
 import asyncio
+from importlib import resources
 from pathlib import Path
 
 from alembic import command
@@ -18,9 +19,19 @@ from sqlalchemy.ext.asyncio import create_async_engine
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
+def _migration_root() -> Path:
+    """Locate Alembic assets in an installed wheel or a source checkout."""
+
+    packaged = resources.files("mailagent").joinpath("_alembic")
+    if packaged.is_dir():
+        return Path(str(packaged))
+    return PROJECT_ROOT
+
+
 def _make_config(database_url: str) -> Config:
-    config = Config(str(PROJECT_ROOT / "alembic.ini"))
-    config.set_main_option("script_location", str(PROJECT_ROOT / "migrations"))
+    migration_root = _migration_root()
+    config = Config(str(migration_root / "alembic.ini"))
+    config.set_main_option("script_location", str(migration_root / "migrations"))
     config.attributes["database_url"] = database_url
     return config
 

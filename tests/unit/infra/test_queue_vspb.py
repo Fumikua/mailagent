@@ -8,6 +8,7 @@ Covers:
 - 16.2 / 16.3 / 16.4: cron job placeholders and their schedule expressions.
 - 16.6: cron registration in ``WorkerSettings`` and feature-flag switching.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -30,7 +31,9 @@ from mailagent.infra.queue import (
     ARCHIVE_JOB_NAME,
     CLEANUP_JOB_NAME,
     CLUSTERING_JOB_NAME,
+    OUTBOX_DISPATCH_JOB_NAME,
     RULE_LEARN_JOB_NAME,
+    WORKER_HEARTBEAT_JOB_NAME,
     archive_job,
     build_mail_understanding_pipeline,
     classify_job,
@@ -85,7 +88,10 @@ def _patch_vertical_and_taxonomy():
             "mailagent.verticals.load_selected_vertical",
             return_value=SimpleNamespace(assets=_make_fake_loaded()),
         ),
-        patch("mailagent.classification.taxonomy.TaxonomyLoader", return_value=taxonomy_loader),
+        patch(
+            "mailagent.classification.taxonomy.TaxonomyLoader",
+            return_value=taxonomy_loader,
+        ),
     )
     return stack
 
@@ -180,7 +186,9 @@ class TestBuildPipelineFeatureFlag:
         assert pipeline._auto_accept_enabled is True
         assert pipeline._version_provider is not None
 
-    def test_fusion_without_target_profiles_does_not_error(self, tmp_path: Path) -> None:
+    def test_fusion_without_target_profiles_does_not_error(
+        self, tmp_path: Path
+    ) -> None:
         """5.6: target_profiles.yaml missing (loaded.target_profiles=None) → no error,
         orchestrator gets target_profile_loader=None (feature off).
         """
@@ -316,10 +324,7 @@ class TestBuildPipelineFeatureFlag:
         classifiers = pipeline._orchestrator._classifiers
         assert classifiers["llm"].body_max_chars == 4000
         assert classifiers["vector"]._cleaning_policy is cleaning_policy
-        assert (
-            classifiers["vector"]._preprocessing_extension
-            is preprocessing_extension
-        )
+        assert classifiers["vector"]._preprocessing_extension is preprocessing_extension
         assert classifiers["vector"]._taxonomy_loader is not None
         provider = pipeline._version_provider
         assert provider is not None
@@ -332,25 +337,32 @@ class TestBuildPipelineFeatureFlag:
 class TestCronJobsSchedule:
     """16.6: cron expressions are correct for each job."""
 
-    def test_four_cron_jobs_registered(self) -> None:
-        assert len(cron_jobs) == 4
+    def test_six_cron_jobs_registered(self) -> None:
+        assert {job.name for job in cron_jobs} == {
+            WORKER_HEARTBEAT_JOB_NAME,
+            OUTBOX_DISPATCH_JOB_NAME,
+            CLUSTERING_JOB_NAME,
+            RULE_LEARN_JOB_NAME,
+            ARCHIVE_JOB_NAME,
+            CLEANUP_JOB_NAME,
+        }
 
     def test_clustering_job_schedule(self) -> None:
-        job = cron_jobs[0]
+        job = next(job for job in cron_jobs if job.name == CLUSTERING_JOB_NAME)
         assert job.name == CLUSTERING_JOB_NAME
         assert job.weekday == "sun"
         assert job.hour == 2
         assert job.minute == 0
 
     def test_rule_learn_job_schedule(self) -> None:
-        job = cron_jobs[1]
+        job = next(job for job in cron_jobs if job.name == RULE_LEARN_JOB_NAME)
         assert job.name == RULE_LEARN_JOB_NAME
         assert job.weekday == "sun"
         assert job.hour == 3
         assert job.minute == 0
 
     def test_archive_job_schedule(self) -> None:
-        job = cron_jobs[2]
+        job = next(job for job in cron_jobs if job.name == ARCHIVE_JOB_NAME)
         assert job.name == ARCHIVE_JOB_NAME
         assert job.day == 1
         assert job.hour == 2
@@ -358,7 +370,7 @@ class TestCronJobsSchedule:
         assert job.weekday is None
 
     def test_cleanup_job_schedule(self) -> None:
-        job = cron_jobs[3]
+        job = next(job for job in cron_jobs if job.name == CLEANUP_JOB_NAME)
         assert job.name == CLEANUP_JOB_NAME
         assert job.hour == 3
         assert job.minute == 30
@@ -373,7 +385,9 @@ class TestCronJobsCallable:
         engine = AsyncMock()
         engine.run_weekly_clustering.return_value = "reports/intent.md"
 
-        assert await clustering_job({"clustering_engine": engine}) == "reports/intent.md"
+        assert (
+            await clustering_job({"clustering_engine": engine}) == "reports/intent.md"
+        )
         engine.run_weekly_clustering.assert_awaited_once_with()
 
     async def test_rule_learn_job_calls_context_engine(self) -> None:
@@ -389,7 +403,10 @@ class TestCronJobsCallable:
         settings = Settings()
         settings.vector_store.archive_window_months = 18
 
-        assert await archive_job({"bootstrap_pipeline": pipeline, "settings": settings}) == "archived: 3"
+        assert (
+            await archive_job({"bootstrap_pipeline": pipeline, "settings": settings})
+            == "archived: 3"
+        )
         pipeline.archive_old_samples.assert_awaited_once_with(18)
 
     @pytest.mark.parametrize("job", [clustering_job, rule_learn_job, archive_job])

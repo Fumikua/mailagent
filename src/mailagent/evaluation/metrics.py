@@ -6,7 +6,7 @@ import math
 from collections import Counter
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from mailagent.domain.models import ClassificationVersions
 
@@ -24,8 +24,24 @@ class ReleaseGate(BaseModel):
 
     overall_precision: float | None = Field(default=0.98, ge=0, le=1)
     label_precision: float | None = Field(default=0.95, ge=0, le=1)
-    noise_precision: float | None = Field(default=0.99, ge=0, le=1)
+    label_precision_overrides: dict[str, float | None] = Field(default_factory=dict)
     minimum_eligible: int = Field(default=100, ge=1)
+
+    @field_validator("label_precision_overrides")
+    @classmethod
+    def validate_label_precision_overrides(
+        cls, overrides: dict[str, float | None]
+    ) -> dict[str, float | None]:
+        for label, threshold in overrides.items():
+            if not label or label != label.strip():
+                raise ValueError(
+                    "label precision override keys must be canonical codes"
+                )
+            if threshold is not None and not 0 <= threshold <= 1:
+                raise ValueError(
+                    "label precision override thresholds must be between 0 and 1"
+                )
+        return overrides
 
 
 class MetricResult(BaseModel):
@@ -69,7 +85,6 @@ GateReasonCode = Literal[
     "insufficient_label_support",
     "overall_precision_below_threshold",
     "label_precision_below_threshold",
-    "noise_precision_below_threshold",
 ]
 
 
@@ -144,9 +159,7 @@ def wilson_interval(
     p = successes / total
     denominator = 1 + z * z / total
     center = (p + z * z / (2 * total)) / denominator
-    margin = z * math.sqrt(
-        (p * (1 - p) + z * z / (4 * total)) / total
-    ) / denominator
+    margin = z * math.sqrt((p * (1 - p) + z * z / (4 * total)) / total) / denominator
     return max(0.0, center - margin), min(1.0, center + margin)
 
 
@@ -154,9 +167,7 @@ def _metric_result(counts: _Counts) -> MetricResult:
     precision_denominator = counts.true_positive + counts.false_positive
     recall_denominator = counts.true_positive + counts.false_negative
     precision = (
-        counts.true_positive / precision_denominator
-        if precision_denominator
-        else None
+        counts.true_positive / precision_denominator if precision_denominator else None
     )
     recall = counts.true_positive / recall_denominator if recall_denominator else None
     return MetricResult(
@@ -176,7 +187,9 @@ def _version_distribution(
     distribution: dict[str, dict[str, int]] = {}
     for field_name in ClassificationVersions.model_fields:
         counts = Counter(
-            str(value) if (value := getattr(prediction.versions, field_name)) is not None else "<none>"
+            str(value)
+            if (value := getattr(prediction.versions, field_name)) is not None
+            else "<none>"
             for prediction in predictions
         )
         distribution[field_name] = dict(sorted(counts.items()))
@@ -220,14 +233,9 @@ def _apply_gate(
         )
     elif gate.overall_precision is not None:
         micro_lower_bound = (
-            micro.wilson_interval[0]
-            if micro.wilson_interval is not None
-            else None
+            micro.wilson_interval[0] if micro.wilson_interval is not None else None
         )
-        if (
-            micro_lower_bound is None
-            or micro_lower_bound < gate.overall_precision
-        ):
+        if micro_lower_bound is None or micro_lower_bound < gate.overall_precision:
             _append_reason(reason_codes, "overall_precision_below_threshold")
             failures.append(
                 GateFailure(
@@ -237,16 +245,9 @@ def _apply_gate(
                 )
             )
 
-    ordered_label_metrics = sorted(
-        per_label.items(), key=lambda item: (item[0] == "noise", item[0])
-    )
-    for label, metric in ordered_label_metrics:
-        if label == "noise":
-            threshold = gate.noise_precision
-            reason_code: GateReasonCode = "noise_precision_below_threshold"
-        else:
-            threshold = gate.label_precision
-            reason_code = "label_precision_below_threshold"
+    for label, metric in sorted(per_label.items()):
+        threshold = gate.label_precision_overrides.get(label, gate.label_precision)
+        reason_code: GateReasonCode = "label_precision_below_threshold"
         if threshold is None:
             continue
         label_decisions = label_eligible_decisions[label]
@@ -265,9 +266,7 @@ def _apply_gate(
             # failure until this label has the governed decision volume.
             continue
         lower_bound = (
-            metric.wilson_interval[0]
-            if metric.wilson_interval is not None
-            else None
+            metric.wilson_interval[0] if metric.wilson_interval is not None else None
         )
         if lower_bound is None or lower_bound < threshold:
             _append_reason(reason_codes, reason_code)
@@ -324,9 +323,7 @@ def evaluate_predictions(
     test_examples = [
         example for example in manifest.examples if example.split == "test"
     ]
-    gold_by_id = {
-        example.sample_id: set(example.labels) for example in test_examples
-    }
+    gold_by_id = {example.sample_id: set(example.labels) for example in test_examples}
     test_sample_ids = set(gold_by_id)
     test_predictions = [
         prediction
@@ -335,16 +332,8 @@ def evaluate_predictions(
     ]
 
     label_names = sorted(
-        {
-            label
-            for labels in gold_by_id.values()
-            for label in labels
-        }
-        | {
-            label
-            for prediction in test_predictions
-            for label in prediction.labels
-        }
+        {label for labels in gold_by_id.values() for label in labels}
+        | {label for prediction in test_predictions for label in prediction.labels}
     )
     micro_counts = _Counts()
     label_counts = {label: _Counts() for label in label_names}
@@ -420,16 +409,11 @@ def evaluate_predictions(
     )
     gold_label_decisions = sum(len(labels) for labels in gold_by_id.values())
     suggestion_recall = (
-        suggested_true_positive / gold_label_decisions
-        if gold_label_decisions
-        else None
+        suggested_true_positive / gold_label_decisions if gold_label_decisions else None
     )
 
     micro = _metric_result(micro_counts)
-    per_label = {
-        label: _metric_result(label_counts[label])
-        for label in label_names
-    }
+    per_label = {label: _metric_result(label_counts[label]) for label in label_names}
     gate_result = _apply_gate(micro, per_label, taxonomy_mismatches, gate)
     total_examples = len(test_examples)
     reviewed_examples = sum(

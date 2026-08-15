@@ -39,4 +39,3 @@ def downgrade() -> None:
     op.drop_table("skill_versions")
     op.drop_index("ix_processing_runs_status", table_name="processing_runs")
     op.drop_table("processing_runs")
-

@@ -1,4 +1,5 @@
 """Installed vertical plugin descriptors and discovery."""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
@@ -10,6 +11,7 @@ from .loader import VerticalConfigurationError
 
 
 VERTICAL_ENTRY_POINT_GROUP = "mailagent.verticals"
+CORE_PLUGIN_API_VERSION = "1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,10 +32,18 @@ class VerticalPlugin:
     namespace: str
     build_runtime: Callable[..., Any]
     validate_profile: Callable[[Any], Iterable[PluginValidationResult]] | None = None
+    api_version: str = CORE_PLUGIN_API_VERSION
 
     def __post_init__(self) -> None:
         if not self.id or not self.namespace or not callable(self.build_runtime):
-            raise ValueError("vertical plugin requires id, namespace, and a runtime builder")
+            raise ValueError(
+                "vertical plugin requires id, namespace, and a runtime builder"
+            )
+        if self.api_version != CORE_PLUGIN_API_VERSION:
+            raise ValueError(
+                f"vertical plugin {self.id!r} targets API {self.api_version!r}; "
+                f"Core supports {CORE_PLUGIN_API_VERSION!r}"
+            )
 
 
 class VerticalPluginRegistry:
@@ -64,7 +74,9 @@ class VerticalPluginRegistry:
             ) from exc
 
     @classmethod
-    def discover(cls) -> "VerticalPluginRegistry":
+    def discover(cls, plugin_id: str | None = None) -> "VerticalPluginRegistry":
+        """Discover plugins, loading only the selected third-party entry point when known."""
+
         registry = cls(_builtin_plugins())
         entry_points = metadata.entry_points()
         selected = (
@@ -73,6 +85,8 @@ class VerticalPluginRegistry:
             else entry_points.get(VERTICAL_ENTRY_POINT_GROUP, ())
         )
         for entry_point in selected:
+            if plugin_id is not None and entry_point.name != plugin_id:
+                continue
             try:
                 candidate = entry_point.load()
             except Exception as exc:

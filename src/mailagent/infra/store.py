@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -19,6 +20,7 @@ from sqlalchemy import (
     func,
     select,
     text,
+    update,
 )
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -86,6 +88,35 @@ class RunRecord(Base):
     fusion_meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[object] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[object] = mapped_column(DateTime(timezone=True))
+
+
+class JobOutboxRecord(Base):
+    """Durable intent to enqueue a background job.
+
+    The row is committed in the same transaction as the run state change, so a
+    Redis outage cannot leave a run permanently pending without a retryable job.
+    """
+
+    __tablename__ = "job_outbox"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    job_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    dispatched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+@dataclass(frozen=True)
+class PendingJob:
+    id: UUID
+    job_name: str
+    payload: dict[str, Any]
+    attempts: int
 
 
 class ClassificationFeedbackRecord(Base):
@@ -156,15 +187,29 @@ class SampleORM(Base):
     source: Mapped[str] = mapped_column(String(32), index=True)
     reviewed: Mapped[bool] = mapped_column(default=False)
     thread_parsed: Mapped[bool] = mapped_column(default=True)
-    embedding_thread: Mapped[list[float] | None] = mapped_column(Embedding(), nullable=True)
-    embedding_segment_0: Mapped[list[float] | None] = mapped_column(Embedding(), nullable=True)
+    embedding_thread: Mapped[list[float] | None] = mapped_column(
+        Embedding(), nullable=True
+    )
+    embedding_segment_0: Mapped[list[float] | None] = mapped_column(
+        Embedding(), nullable=True
+    )
     created_at: Mapped[object] = mapped_column(DateTime(timezone=True), index=True)
-    batch_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    taxonomy_schema_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    batch_confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    taxonomy_schema_version: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
     retrieval_document: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    retrieval_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    retrieval_policy_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    quality_disposition: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    retrieval_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    retrieval_policy_version: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    quality_disposition: Mapped[str | None] = mapped_column(
+        String(16), nullable=True, index=True
+    )
     quality_reasons: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     review_override_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -192,14 +237,24 @@ class SampleArchiveORM(Base):
     source: Mapped[str] = mapped_column(String(32))
     reviewed: Mapped[bool] = mapped_column(default=False)
     thread_parsed: Mapped[bool] = mapped_column(default=True)
-    embedding_thread: Mapped[list[float] | None] = mapped_column(Embedding(), nullable=True)
-    embedding_segment_0: Mapped[list[float] | None] = mapped_column(Embedding(), nullable=True)
+    embedding_thread: Mapped[list[float] | None] = mapped_column(
+        Embedding(), nullable=True
+    )
+    embedding_segment_0: Mapped[list[float] | None] = mapped_column(
+        Embedding(), nullable=True
+    )
     created_at: Mapped[object] = mapped_column(DateTime(timezone=True))
-    batch_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    taxonomy_schema_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    batch_confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    taxonomy_schema_version: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
     retrieval_document: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     retrieval_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    retrieval_policy_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    retrieval_policy_version: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     quality_disposition: Mapped[str | None] = mapped_column(String(16), nullable=True)
     quality_reasons: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     review_override_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -221,7 +276,9 @@ class SqlStore:
 
     async def save_run(self, run: RunResponse) -> None:
         payload = run.model_dump(mode="json")
-        classification_json = run.classification.model_dump_json() if run.classification else None
+        classification_json = (
+            run.classification.model_dump_json() if run.classification else None
+        )
         # 注：calibration_log 嵌入 classification JSON 内（ClassificationResponse.calibration_log）
         async with self.sessions() as session:
             record = await session.get(RunRecord, str(run.id))
@@ -242,6 +299,90 @@ class SqlStore:
                 if classification_json is not None:
                     record.classification = classification_json
                 record.updated_at = run.updated_at
+            await session.commit()
+
+    @staticmethod
+    def _new_outbox_record(job_name: str, payload: dict[str, Any]) -> JobOutboxRecord:
+        return JobOutboxRecord(
+            id=str(uuid4()),
+            job_name=job_name,
+            payload=payload,
+            created_at=datetime.now(timezone.utc),
+            dispatched_at=None,
+            attempts=0,
+            last_error=None,
+        )
+
+    async def save_run_with_outbox(
+        self,
+        run: RunResponse,
+        *,
+        job_name: str,
+        job_payload: dict[str, Any],
+    ) -> PendingJob:
+        """Atomically persist a new run and its enqueue intent."""
+
+        classification_json = (
+            run.classification.model_dump_json() if run.classification else None
+        )
+        outbox = self._new_outbox_record(job_name, job_payload)
+        async with self.sessions() as session:
+            session.add(
+                RunRecord(
+                    id=str(run.id),
+                    status=run.status.value,
+                    payload=run.model_dump(mode="json"),
+                    classification=classification_json,
+                    created_at=run.created_at,
+                    updated_at=run.updated_at,
+                )
+            )
+            session.add(outbox)
+            await session.commit()
+        return PendingJob(
+            UUID(outbox.id), outbox.job_name, outbox.payload, outbox.attempts
+        )
+
+    async def list_pending_outbox(self, *, limit: int = 100) -> list[PendingJob]:
+        async with self.sessions() as session:
+            records = (
+                await session.scalars(
+                    select(JobOutboxRecord)
+                    .where(JobOutboxRecord.dispatched_at.is_(None))
+                    .order_by(JobOutboxRecord.created_at.asc())
+                    .limit(limit)
+                )
+            ).all()
+            return [
+                PendingJob(
+                    UUID(record.id), record.job_name, record.payload, record.attempts
+                )
+                for record in records
+            ]
+
+    async def mark_outbox_dispatched(self, outbox_id: UUID) -> None:
+        async with self.sessions() as session:
+            await session.execute(
+                update(JobOutboxRecord)
+                .where(JobOutboxRecord.id == str(outbox_id))
+                .values(
+                    dispatched_at=datetime.now(timezone.utc),
+                    attempts=JobOutboxRecord.attempts + 1,
+                    last_error=None,
+                )
+            )
+            await session.commit()
+
+    async def record_outbox_failure(self, outbox_id: UUID, error: str) -> None:
+        async with self.sessions() as session:
+            await session.execute(
+                update(JobOutboxRecord)
+                .where(JobOutboxRecord.id == str(outbox_id))
+                .values(
+                    attempts=JobOutboxRecord.attempts + 1,
+                    last_error=error[:4000],
+                )
+            )
             await session.commit()
 
     async def get_run(self, run_id: UUID) -> RunResponse | None:
@@ -377,6 +518,90 @@ class SqlStore:
             record.updated_at = datetime.now(timezone.utc)
             await session.commit()
 
+    async def transition_run_status(
+        self,
+        run_id: UUID,
+        *,
+        expected: set["RunStatus"],
+        target: "RunStatus",
+    ) -> bool:
+        """Compare-and-set a run status, returning whether this caller won."""
+
+        async with self.sessions() as session:
+            result = await session.execute(
+                update(RunRecord)
+                .where(
+                    RunRecord.id == str(run_id),
+                    RunRecord.status.in_([status.value for status in expected]),
+                )
+                .values(status=target.value, updated_at=datetime.now(timezone.utc))
+            )
+            await session.commit()
+            return getattr(result, "rowcount", 0) == 1
+
+    async def replace_run_if_status(
+        self,
+        run: RunResponse,
+        *,
+        expected: set["RunStatus"],
+    ) -> bool:
+        """Persist a full run only when its current DB status is expected."""
+
+        classification_json = (
+            run.classification.model_dump_json() if run.classification else None
+        )
+        values: dict[str, Any] = {
+            "status": run.status.value,
+            "payload": run.model_dump(mode="json"),
+            "updated_at": run.updated_at,
+        }
+        if classification_json is not None:
+            values["classification"] = classification_json
+        async with self.sessions() as session:
+            result = await session.execute(
+                update(RunRecord)
+                .where(
+                    RunRecord.id == str(run.id),
+                    RunRecord.status.in_([status.value for status in expected]),
+                )
+                .values(**values)
+            )
+            await session.commit()
+            return getattr(result, "rowcount", 0) == 1
+
+    async def replace_run_with_outbox_if_status(
+        self,
+        run: RunResponse,
+        *,
+        expected: set["RunStatus"],
+        job_name: str,
+        job_payload: dict[str, Any],
+    ) -> PendingJob | None:
+        """CAS a run and create its enqueue intent in one transaction."""
+
+        outbox = self._new_outbox_record(job_name, job_payload)
+        async with self.sessions() as session:
+            result = await session.execute(
+                update(RunRecord)
+                .where(
+                    RunRecord.id == str(run.id),
+                    RunRecord.status.in_([status.value for status in expected]),
+                )
+                .values(
+                    status=run.status.value,
+                    payload=run.model_dump(mode="json"),
+                    updated_at=run.updated_at,
+                )
+            )
+            if getattr(result, "rowcount", 0) != 1:
+                await session.rollback()
+                return None
+            session.add(outbox)
+            await session.commit()
+        return PendingJob(
+            UUID(outbox.id), outbox.job_name, outbox.payload, outbox.attempts
+        )
+
     async def update_run_classification(
         self,
         run_id: UUID,
@@ -417,6 +642,48 @@ class SqlStore:
             record.updated_at = datetime.now(timezone.utc)
             await session.commit()
 
+    async def complete_run_classification(
+        self,
+        run_id: UUID,
+        classification: ClassificationResponse,
+        *,
+        status: "RunStatus",
+    ) -> bool:
+        """Store a worker result only while the run is still PROCESSING."""
+
+        from ..domain.models import RunStatus
+
+        classification_payload = classification.model_dump(mode="json")
+        fusion_meta = (
+            classification.fusion_meta.model_dump(mode="json")
+            if classification.fusion_meta
+            else None
+        )
+        async with self.sessions() as session:
+            record = await session.scalar(
+                select(RunRecord).where(
+                    RunRecord.id == str(run_id),
+                    RunRecord.status == RunStatus.PROCESSING.value,
+                )
+            )
+            if record is None:
+                return False
+            payload = dict(record.payload or {})
+            payload["classification"] = classification_payload
+            payload["status"] = status.value
+            record.classification = classification.model_dump_json()
+            record.calibration_log = (
+                classification.calibration_log.model_dump_json()
+                if classification.calibration_log
+                else None
+            )
+            record.fusion_meta = fusion_meta
+            record.status = status.value
+            record.payload = payload
+            record.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+            return True
+
     async def save_fusion_meta(self, run_id: UUID, fusion_meta: FusionMeta) -> None:
         """Persist fusion audit metadata to the ``fusion_meta`` JSON column.
 
@@ -446,15 +713,35 @@ class SqlStore:
 
     async def create_skill(self, definition: SkillDefinition) -> SkillVersion:
         async with self.sessions() as session:
-            result = await session.scalar(select(SkillRecord.version).where(SkillRecord.skill_id == str(definition.id)).order_by(SkillRecord.version.desc()))
-            skill = SkillVersion(skill_id=definition.id, version=(result or 0) + 1, definition=definition)
-            session.add(SkillRecord(id=str(skill.id), skill_id=str(skill.skill_id), version=skill.version, published=False, payload=skill.model_dump(mode="json")))
+            result = await session.scalar(
+                select(SkillRecord.version)
+                .where(SkillRecord.skill_id == str(definition.id))
+                .order_by(SkillRecord.version.desc())
+            )
+            skill = SkillVersion(
+                skill_id=definition.id, version=(result or 0) + 1, definition=definition
+            )
+            session.add(
+                SkillRecord(
+                    id=str(skill.id),
+                    skill_id=str(skill.skill_id),
+                    version=skill.version,
+                    published=False,
+                    payload=skill.model_dump(mode="json"),
+                )
+            )
             await session.commit()
             return skill
 
     async def list_skills(self) -> list[SkillVersion]:
         async with self.sessions() as session:
-            records = (await session.scalars(select(SkillRecord).order_by(SkillRecord.skill_id, SkillRecord.version.desc()))).all()
+            records = (
+                await session.scalars(
+                    select(SkillRecord).order_by(
+                        SkillRecord.skill_id, SkillRecord.version.desc()
+                    )
+                )
+            ).all()
             return [SkillVersion.model_validate(record.payload) for record in records]
 
     async def get_published(self, skill_id: UUID | None) -> SkillVersion | None:
@@ -472,11 +759,15 @@ class SqlStore:
 
     async def publish_skill(self, skill_id: UUID) -> SkillVersion | None:
         async with self.sessions() as session:
-            record = await session.scalar(select(SkillRecord).where(SkillRecord.id == str(skill_id)))
+            record = await session.scalar(
+                select(SkillRecord).where(SkillRecord.id == str(skill_id))
+            )
             if not record:
                 return None
             record.published = True
-            skill = SkillVersion.model_validate(record.payload).model_copy(update={"published_at": datetime.now(timezone.utc)})
+            skill = SkillVersion.model_validate(record.payload).model_copy(
+                update={"published_at": datetime.now(timezone.utc)}
+            )
             record.payload = skill.model_dump(mode="json")
             await session.commit()
             return skill
@@ -505,7 +796,9 @@ class SqlStore:
             if feedback_retention_days > 0:
                 cutoff = now - timedelta(days=feedback_retention_days)
                 result = await conn.execute(
-                    text("DELETE FROM classification_feedback WHERE reviewed_at < :cutoff"),
+                    text(
+                        "DELETE FROM classification_feedback WHERE reviewed_at < :cutoff"
+                    ),
                     {"cutoff": cutoff},
                 )
                 deleted["classification_feedback"] = result.rowcount
@@ -551,7 +844,9 @@ class SqlStore:
             if backfill_audit_retention_days > 0:
                 cutoff = now - timedelta(days=backfill_audit_retention_days)
                 result = await conn.execute(
-                    text("DELETE FROM mail_gateway_backfill_audit WHERE created_at < :cutoff"),
+                    text(
+                        "DELETE FROM mail_gateway_backfill_audit WHERE created_at < :cutoff"
+                    ),
                     {"cutoff": cutoff},
                 )
                 deleted["mail_gateway_backfill_audit"] = result.rowcount

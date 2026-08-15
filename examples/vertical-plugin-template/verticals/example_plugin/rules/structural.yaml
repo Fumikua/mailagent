@@ -1,4 +1,3 @@
 - condition: "body_length < 40"
   label: automated
   confidence: 0.60
-

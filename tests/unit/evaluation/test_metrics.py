@@ -15,7 +15,9 @@ from mailagent.evaluation import (
 )
 
 
-def _versions(taxonomy: str = "taxonomy-v1", model: str = "model-v1") -> ClassificationVersions:
+def _versions(
+    taxonomy: str = "taxonomy-v1", model: str = "model-v1"
+) -> ClassificationVersions:
     return ClassificationVersions(
         taxonomy=taxonomy,
         rules="rules-v1",
@@ -86,7 +88,7 @@ def _small_gate(**overrides: object) -> ReleaseGate:
     values: dict[str, object] = {
         "overall_precision": 0.0,
         "label_precision": 0.0,
-        "noise_precision": 0.0,
+        "label_precision_overrides": {"noise": 0.0},
         "minimum_eligible": 1,
     }
     values.update(overrides)
@@ -110,7 +112,9 @@ def test_evaluation_counts_only_non_review_predictions_as_auto_accepts() -> None
     assert report.suggestion_recall == 0.5
 
 
-def test_multi_label_metrics_use_set_based_true_false_positive_and_negative_counts() -> None:
+def test_multi_label_metrics_use_set_based_true_false_positive_and_negative_counts() -> (
+    None
+):
     manifest = _manifest(
         _example("sample-a", ["alpha", "beta"]),
         _example("sample-b", ["beta"]),
@@ -126,7 +130,7 @@ def test_multi_label_metrics_use_set_based_true_false_positive_and_negative_coun
     report = evaluate_predictions(
         manifest,
         predictions,
-        _small_gate(label_precision=None, noise_precision=None),
+        _small_gate(label_precision=None, label_precision_overrides={}),
     )
 
     assert report.micro.true_positive == 2
@@ -149,7 +153,7 @@ def test_zero_auto_accepts_have_undefined_precision_and_wilson_interval() -> Non
     report = evaluate_predictions(
         manifest,
         predictions,
-        _small_gate(label_precision=None, noise_precision=None),
+        _small_gate(label_precision=None, label_precision_overrides={}),
     )
 
     assert report.micro.precision is None
@@ -184,7 +188,7 @@ def test_per_label_precision_and_false_positive_ids_are_deterministic() -> None:
     assert report.mismatches[0].predicted_labels == ["noise"]
 
 
-def test_noise_precision_gate_uses_the_99_percent_threshold() -> None:
+def test_label_precision_override_uses_the_configured_threshold() -> None:
     correct = [_example(f"noise-{index:03d}", ["noise"]) for index in range(99)]
     first_error = _example("not-noise-100", ["schedule"])
     manifest = _manifest(*correct, first_error)
@@ -195,7 +199,7 @@ def test_noise_precision_gate_uses_the_99_percent_threshold() -> None:
     gate = ReleaseGate(
         overall_precision=None,
         label_precision=None,
-        noise_precision=0.99,
+        label_precision_overrides={"noise": 0.99},
         minimum_eligible=1,
     )
 
@@ -204,9 +208,7 @@ def test_noise_precision_gate_uses_the_99_percent_threshold() -> None:
     assert wilson_failing.per_label["noise"].wilson_interval is not None
     assert wilson_failing.per_label["noise"].wilson_interval[0] < 0.99
     assert wilson_failing.gate.passed is False
-    assert wilson_failing.gate.reason_codes == [
-        "noise_precision_below_threshold"
-    ]
+    assert wilson_failing.gate.reason_codes == ["label_precision_below_threshold"]
     assert wilson_failing.gate.failures[0].actual == pytest.approx(
         wilson_failing.per_label["noise"].wilson_interval[0]
     )
@@ -218,7 +220,7 @@ def test_noise_precision_gate_uses_the_99_percent_threshold() -> None:
         gate,
     )
     assert failing.gate.passed is False
-    assert failing.gate.reason_codes == ["noise_precision_below_threshold"]
+    assert failing.gate.reason_codes == ["label_precision_below_threshold"]
     assert failing.gate.failures[0].label == "noise"
 
 
@@ -231,10 +233,7 @@ def test_release_gate_excludes_development_and_calibration_examples() -> None:
     test_example = _example("test-001", ["schedule"])
     manifest = _manifest(*development, calibration, test_example)
     predictions = [
-        *[
-            _prediction(example.sample_id, ["schedule"])
-            for example in development
-        ],
+        *[_prediction(example.sample_id, ["schedule"]) for example in development],
         _prediction(calibration.sample_id, ["noise"]),
         _prediction(test_example.sample_id, ["schedule"]),
     ]
@@ -257,8 +256,7 @@ def test_release_gate_excludes_development_and_calibration_examples() -> None:
 
 def test_every_enabled_label_requires_its_own_minimum_support() -> None:
     schedule_examples = [
-        _example(f"schedule-{index:03d}", ["schedule"])
-        for index in range(100)
+        _example(f"schedule-{index:03d}", ["schedule"]) for index in range(100)
     ]
     noise_example = _example("noise-001", ["noise"])
     manifest = _manifest(*schedule_examples, noise_example)
@@ -276,7 +274,7 @@ def test_every_enabled_label_requires_its_own_minimum_support() -> None:
         ReleaseGate(
             overall_precision=0.0,
             label_precision=0.0,
-            noise_precision=0.0,
+            label_precision_overrides={"noise": 0.0},
             minimum_eligible=100,
         ),
     )
@@ -297,13 +295,8 @@ def test_every_enabled_label_requires_its_own_minimum_support() -> None:
 
 
 def test_wilson_lower_bound_controls_micro_and_label_precision_gates() -> None:
-    examples = [
-        _example(f"schedule-{index:03d}", ["schedule"])
-        for index in range(100)
-    ]
-    predictions = [
-        _prediction(example.sample_id, ["schedule"]) for example in examples
-    ]
+    examples = [_example(f"schedule-{index:03d}", ["schedule"]) for index in range(100)]
+    predictions = [_prediction(example.sample_id, ["schedule"]) for example in examples]
 
     report = evaluate_predictions(
         _manifest(*examples),
@@ -311,7 +304,7 @@ def test_wilson_lower_bound_controls_micro_and_label_precision_gates() -> None:
         ReleaseGate(
             overall_precision=0.98,
             label_precision=0.95,
-            noise_precision=None,
+            label_precision_overrides={},
             minimum_eligible=100,
         ),
     )
@@ -334,7 +327,7 @@ def test_gate_is_ineligible_below_minimum_auto_accepted_label_decisions() -> Non
         _small_gate(
             minimum_eligible=2,
             label_precision=None,
-            noise_precision=None,
+            label_precision_overrides={},
         ),
     )
 
@@ -349,10 +342,16 @@ def test_gate_is_ineligible_below_minimum_auto_accepted_label_decisions() -> Non
     ("predictions", "message"),
     [
         (
-            [_prediction("sample-1", ["schedule"]), _prediction("sample-1", ["schedule"])],
+            [
+                _prediction("sample-1", ["schedule"]),
+                _prediction("sample-1", ["schedule"]),
+            ],
             "duplicate prediction sample_id: sample-1",
         ),
-        ([_prediction("unknown", ["schedule"])], "unknown prediction sample_id: unknown"),
+        (
+            [_prediction("unknown", ["schedule"])],
+            "unknown prediction sample_id: unknown",
+        ),
     ],
 )
 def test_duplicate_or_unknown_prediction_ids_fail_validation(
@@ -372,11 +371,14 @@ def test_prediction_version_distribution_counts_all_saved_predictions() -> None:
     report = evaluate_predictions(
         _manifest(),
         predictions,
-        _small_gate(label_precision=None, noise_precision=None),
+        _small_gate(label_precision=None, label_precision_overrides={}),
     )
 
     assert report.prediction_version_distribution["taxonomy"] == {"taxonomy-v1": 3}
-    assert report.prediction_version_distribution["model"] == {"model-a": 2, "model-b": 1}
+    assert report.prediction_version_distribution["model"] == {
+        "model-a": 2,
+        "model-b": 1,
+    }
     assert report.prediction_version_distribution["preprocessing"] == {
         "preprocessing-v1": 3
     }
@@ -392,13 +394,15 @@ def test_taxonomy_version_mismatch_keeps_metrics_but_fails_closed() -> None:
     report = evaluate_predictions(
         _manifest(),
         predictions,
-        _small_gate(label_precision=None, noise_precision=None),
+        _small_gate(label_precision=None, label_precision_overrides={}),
     )
 
     assert report.micro.precision == 0.5
     assert report.gate.passed is False
     assert report.gate.reason_codes == ["taxonomy_version_mismatch"]
-    assert [mismatch.model_dump() for mismatch in report.taxonomy_version_mismatches] == [
+    assert [
+        mismatch.model_dump() for mismatch in report.taxonomy_version_mismatches
+    ] == [
         {
             "sample_id": "sample-1",
             "expected_taxonomy_version": "taxonomy-v1",
@@ -421,7 +425,7 @@ def test_gate_reports_stable_reason_codes_and_label_failure_details() -> None:
     gate = ReleaseGate(
         overall_precision=0.98,
         label_precision=0.95,
-        noise_precision=0.99,
+        label_precision_overrides={"noise": 0.99},
         minimum_eligible=1,
     )
 
@@ -430,11 +434,12 @@ def test_gate_reports_stable_reason_codes_and_label_failure_details() -> None:
     assert report.gate.reason_codes == [
         "overall_precision_below_threshold",
         "label_precision_below_threshold",
-        "noise_precision_below_threshold",
     ]
-    assert [(failure.reason_code, failure.label) for failure in report.gate.failures] == [
+    assert [
+        (failure.reason_code, failure.label) for failure in report.gate.failures
+    ] == [
         ("overall_precision_below_threshold", None),
+        ("label_precision_below_threshold", "noise"),
         ("label_precision_below_threshold", "operation"),
         ("label_precision_below_threshold", "schedule"),
-        ("noise_precision_below_threshold", "noise"),
     ]

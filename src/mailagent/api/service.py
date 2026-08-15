@@ -18,6 +18,10 @@ from ..infra.store import SqlStore
 logger = logging.getLogger(__name__)
 
 
+class InvalidRunTransition(RuntimeError):
+    """The run exists, but its current state does not allow this operation."""
+
+
 class MailProcessingService:
     """邮件处理服务
 
@@ -44,7 +48,11 @@ class MailProcessingService:
         self._redis_pool = redis_pool
 
     async def create_run(
-        self, request: CreateRunRequest, *, enqueue: bool = True
+        self,
+        request: CreateRunRequest,
+        *,
+        enqueue: bool = True,
+        actor_id: str = "system",
     ) -> RunResponse:
         """创建 PENDING 状态的 run，入队 arq 任务后立即返回"""
 
@@ -57,19 +65,40 @@ class MailProcessingService:
             skill_version_id=skill.id if skill else None,
             decision=None,
             actions=[],
-            trace=["create_run:enqueued"],
+            trace=[f"actor:{actor_id}", "create_run:enqueued"],
             created_at=now,
             updated_at=now,
         )
-        await self.store.save_run(run)
+        pending_job = None
+        if enqueue:
+            from ..infra.queue import CLASSIFY_JOB_NAME
+
+            pending_job = await self.store.save_run_with_outbox(
+                run,
+                job_name=CLASSIFY_JOB_NAME,
+                job_payload={"run_id": str(run.id)},
+            )
+        else:
+            await self.store.save_run(run)
 
         # 入队 arq 任务（如配置了 enqueue_fn + redis pool）
-        if enqueue and self._enqueue_fn and self._redis_pool is not None:
+        if pending_job is not None and self._redis_pool is not None:
             try:
-                job_id = await self.enqueue_run(run.id)
-                logger.info("enqueued classify job: run_id=%s job_id=%s", run.id, job_id)
+                from ..infra.queue import dispatch_outbox_item
+
+                job_id = await dispatch_outbox_item(
+                    self._redis_pool,
+                    self.store,
+                    pending_job,
+                )
+                logger.info(
+                    "enqueued classify job: run_id=%s job_id=%s", run.id, job_id
+                )
             except Exception as exc:
-                logger.error("failed to enqueue classify job: %s (run stays PENDING)", exc)
+                logger.error(
+                    "failed to enqueue classify job: %s (durable outbox will retry)",
+                    exc,
+                )
         else:
             logger.debug("no enqueue_fn configured, run stays PENDING: %s", run.id)
 
@@ -93,7 +122,9 @@ class MailProcessingService:
     ) -> RunResponse | None:
         """Worker 调用：更新分类结果与最终状态。"""
 
-        await self.store.update_run_classification(run_id, classification, status=status)
+        await self.store.update_run_classification(
+            run_id, classification, status=status
+        )
         return await self.store.get_run(run_id)
 
     async def get_run(self, run_id: UUID) -> RunResponse | None:
@@ -105,6 +136,7 @@ class MailProcessingService:
         feedback: ClassificationFeedbackRequest,
         *,
         valid_labels: set[str],
+        exclusive_labels: set[str],
         reviewer_id: str,
     ) -> ClassificationFeedback | None:
         run = await self.store.get_run(run_id)
@@ -117,11 +149,13 @@ class MailProcessingService:
         invalid_labels = sorted(final_label_set - valid_labels)
         if invalid_labels:
             raise ValueError(
-                "labels are absent from active taxonomy: "
-                + ", ".join(invalid_labels)
+                "labels are absent from active taxonomy: " + ", ".join(invalid_labels)
             )
-        if "noise" in final_label_set and len(final_label_set) > 1:
-            raise ValueError("noise cannot be combined with a business label")
+        selected_exclusive = sorted(final_label_set & exclusive_labels)
+        if selected_exclusive and len(final_label_set) > 1:
+            raise ValueError(
+                f"exclusive label {selected_exclusive[0]} cannot be combined with another label"
+            )
 
         return await self.store.append_classification_feedback(
             run_id=run_id,
@@ -140,25 +174,73 @@ class MailProcessingService:
             return None
         return await self.store.list_classification_feedback(run_id)
 
-    async def approve(self, run_id: UUID) -> RunResponse | None:
+    async def approve(
+        self, run_id: UUID, *, actor_id: str = "system"
+    ) -> RunResponse | None:
         run = await self.get_run(run_id)
         if not run:
             return None
-        actions = [action.model_copy(update={"status": "approved" if action.status == "proposed" else action.status}) for action in run.actions]
-        updated = run.model_copy(update={"status": RunStatus.COMPLETED, "actions": actions, "trace": [*run.trace, "approval:recorded_no_send"], "updated_at": datetime.now(timezone.utc)})
-        await self.store.save_run(updated)
+        actions = [
+            action.model_copy(
+                update={
+                    "status": "approved"
+                    if action.status == "proposed"
+                    else action.status
+                }
+            )
+            for action in run.actions
+        ]
+        updated = run.model_copy(
+            update={
+                "status": RunStatus.COMPLETED,
+                "actions": actions,
+                "trace": [*run.trace, f"actor:{actor_id}", "approval:recorded_no_send"],
+                "updated_at": datetime.now(timezone.utc),
+            }
+        )
+        saved = await self.store.replace_run_if_status(
+            updated,
+            expected={RunStatus.WAITING_APPROVAL},
+        )
+        if not saved:
+            raise InvalidRunTransition("run is not waiting for approval")
         return updated
 
-    async def reject(self, run_id: UUID) -> RunResponse | None:
+    async def reject(
+        self, run_id: UUID, *, actor_id: str = "system"
+    ) -> RunResponse | None:
         run = await self.get_run(run_id)
         if not run:
             return None
-        actions = [action.model_copy(update={"status": "rejected" if action.status in {"proposed", "blocked"} else action.status}) for action in run.actions]
-        updated = run.model_copy(update={"status": RunStatus.REJECTED, "actions": actions, "trace": [*run.trace, "approval:rejected"], "updated_at": datetime.now(timezone.utc)})
-        await self.store.save_run(updated)
+        actions = [
+            action.model_copy(
+                update={
+                    "status": "rejected"
+                    if action.status in {"proposed", "blocked"}
+                    else action.status
+                }
+            )
+            for action in run.actions
+        ]
+        updated = run.model_copy(
+            update={
+                "status": RunStatus.REJECTED,
+                "actions": actions,
+                "trace": [*run.trace, f"actor:{actor_id}", "approval:rejected"],
+                "updated_at": datetime.now(timezone.utc),
+            }
+        )
+        saved = await self.store.replace_run_if_status(
+            updated,
+            expected={RunStatus.WAITING_APPROVAL},
+        )
+        if not saved:
+            raise InvalidRunTransition("run is not waiting for approval")
         return updated
 
-    async def retry(self, run_id: UUID) -> RunResponse | None:
+    async def retry(
+        self, run_id: UUID, *, actor_id: str = "system"
+    ) -> RunResponse | None:
         """重新入队分类（不立即处理，状态保持 PENDING 等待 Worker）"""
 
         previous = await self.get_run(run_id)
@@ -168,17 +250,27 @@ class MailProcessingService:
         updated = previous.model_copy(
             update={
                 "status": RunStatus.PENDING,
-                "trace": [*previous.trace, "retry:re-enqueued"],
+                "trace": [*previous.trace, f"actor:{actor_id}", "retry:re-enqueued"],
                 "updated_at": datetime.now(timezone.utc),
             }
         )
-        await self.store.save_run(updated)
+        from ..infra.queue import CLASSIFY_JOB_NAME
 
-        # 重新入队
-        if self._enqueue_fn and self._redis_pool is not None:
+        pending_job = await self.store.replace_run_with_outbox_if_status(
+            updated,
+            expected={RunStatus.FAILED},
+            job_name=CLASSIFY_JOB_NAME,
+            job_payload={"run_id": str(run_id)},
+        )
+        if pending_job is None:
+            raise InvalidRunTransition("only failed runs can be retried")
+
+        if self._redis_pool is not None:
             try:
-                await self._enqueue_fn(self._redis_pool, str(run_id))
+                from ..infra.queue import dispatch_outbox_item
+
+                await dispatch_outbox_item(self._redis_pool, self.store, pending_job)
             except Exception as exc:
-                logger.error("failed to re-enqueue: %s", exc)
+                logger.error("failed to re-enqueue; durable outbox will retry: %s", exc)
 
         return updated

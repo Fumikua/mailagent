@@ -10,4 +10,3 @@ plugin = VerticalPlugin(
     namespace="example_plugin",
     build_runtime=build_empty_runtime,
 )
-
