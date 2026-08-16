@@ -14,13 +14,16 @@ down_revision = "0002_add_classification"
 branch_labels = None
 depends_on = None
 
+EMBEDDING_DIMENSION = 4096
+PGVECTOR_HNSW_MAX_DIMENSIONS = 2000
+
 
 def upgrade() -> None:
     bind = op.get_bind()
     is_postgresql = bind.dialect.name == "postgresql"
     if is_postgresql:
         op.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    embedding_type = Vector(4096) if is_postgresql else sa.JSON()
+    embedding_type = Vector(EMBEDDING_DIMENSION) if is_postgresql else sa.JSON()
 
     # Add fusion_meta JSON column to processing_runs (nullable — present when
     # three-path fusion produces audit metadata; NULL for legacy / non-fusion runs)
@@ -28,7 +31,7 @@ def upgrade() -> None:
 
     # Create samples table for Path B vector similarity search.
     # SQLite stores embeddings as JSON lists; PostgreSQL stores native pgvector
-    # values so cosine HNSW indexes can be created in this migration.
+    # values for cosine-distance queries.
     op.create_table(
         "samples",
         sa.Column("id", sa.String(length=36), primary_key=True),
@@ -59,8 +62,9 @@ def upgrade() -> None:
     op.create_index("idx_samples_mail_hash", "samples", ["mail_hash"])
     op.create_index("idx_samples_label_l1", "samples", ["label_l1"])
 
-    # PostgreSQL: create pgvector HNSW indexes for coarse and fine retrieval.
-    if is_postgresql:
+    # pgvector's vector HNSW implementation supports at most 2,000 dimensions.
+    # The current 4,096-dimensional embeddings therefore use exact cosine scans.
+    if is_postgresql and EMBEDDING_DIMENSION <= PGVECTOR_HNSW_MAX_DIMENSIONS:
         op.execute(
             "CREATE INDEX idx_samples_embedding_thread_hnsw "
             "ON samples USING hnsw (embedding_thread vector_cosine_ops)"

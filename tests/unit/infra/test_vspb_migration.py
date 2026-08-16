@@ -54,7 +54,7 @@ def _sample_columns(op: RecordingOp) -> dict[str, sa.Column[Any]]:
     return {column.name: column for column in columns}
 
 
-def test_postgres_upgrade_uses_vector_columns_and_two_hnsw_indexes() -> None:
+def test_postgres_upgrade_uses_4096_vector_without_unsupported_hnsw_indexes() -> None:
     migration = _load_migration()
     op = RecordingOp("postgresql")
     migration.op = op
@@ -66,6 +66,18 @@ def test_postgres_upgrade_uses_vector_columns_and_two_hnsw_indexes() -> None:
     assert str(columns["embedding_segment_0"].type) == "VECTOR(4096)"
     assert columns["mail_hash"].unique is True
     assert "CREATE EXTENSION IF NOT EXISTS vector" in op.executed_sql
+    assert migration.EMBEDDING_DIMENSION > migration.PGVECTOR_HNSW_MAX_DIMENSIONS
+    assert not any("USING hnsw" in sql for sql in op.executed_sql)
+
+
+def test_postgres_upgrade_creates_hnsw_indexes_for_supported_dimensions() -> None:
+    migration = _load_migration()
+    migration.EMBEDDING_DIMENSION = migration.PGVECTOR_HNSW_MAX_DIMENSIONS
+    op = RecordingOp("postgresql")
+    migration.op = op
+
+    migration.upgrade()
+
     assert any("idx_samples_embedding_thread_hnsw" in sql for sql in op.executed_sql)
     assert any("idx_samples_embedding_segment_0_hnsw" in sql for sql in op.executed_sql)
 
